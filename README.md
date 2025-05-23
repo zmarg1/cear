@@ -1,1 +1,1 @@
-# cear
+# CEAR Hub Community Portal Project
