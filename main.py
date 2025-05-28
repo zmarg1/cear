@@ -9,7 +9,7 @@ DATA_URL = "https://www.dropbox.com/s/a3qivjdpc30aqg1/all_sensor_data.csv?dl=1"
 def download_data():
     url = DATA_URL
     output_dir = "raw_data"
-    output_filename = "all_sensor_data.csv"
+    output_filename = "sea_level_data.csv"
     output_path = os.path.join(output_dir, output_filename)
 
     # Create the directory if it doesn't exist
@@ -52,7 +52,7 @@ def explore_data(csv_path):
     except Exception as e:
         print(f"Failed to load or analyze CSV. Error: {e}")
 
-def populate_database(csv_path="raw_data/all_sensor_data.csv", db_path="sea_level_data.db"):
+def populate_database(csv_path="raw_data/sea_level_data.csv", db_path="cear.db"):
     print("Loading data from CSV...")
     df = pd.read_csv(csv_path)
 
@@ -107,7 +107,7 @@ def populate_database(csv_path="raw_data/all_sensor_data.csv", db_path="sea_leve
     print("Measurements inserted successfully.")
     conn.close()
 
-def reset_database(db_path="sea_level_data.db"):
+def reset_database(db_path="cear.db"):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute("DROP VIEW IF EXISTS daily_sensor_stats;")
@@ -176,7 +176,7 @@ def explor_location_differences(df, sensor_ids):
         print(level_stats.round(3))
 
 if __name__ == "__main__":
-    sensor_data_path = os.path.join("raw_data", "all_sensor_data.csv")
+    sensor_data_path = os.path.join("raw_data", "sea_level_data.csv")
     df = pd.read_csv(sensor_data_path)
     populate_database()
 

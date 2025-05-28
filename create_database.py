@@ -1,6 +1,6 @@
 import sqlite3
 
-def create_database(db_path="sea_level_data.db"):
+def create_database(db_path="cear.db"):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
@@ -53,7 +53,7 @@ def create_database(db_path="sea_level_data.db"):
 
     conn.commit()
     conn.close()
-    print("✅ Database and tables created successfully.")
+    print("Database and tables created successfully.")
 
 if __name__ == "__main__":
     create_database()
