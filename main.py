@@ -85,7 +85,7 @@ def populate_database(csv_path="raw_data/all_sensor_data.csv", db_path="sea_leve
         new_sensors_df.to_sql("sensors", conn, if_exists="append", index=False)
         print(f"Inserted {len(new_sensors_df)} new sensors.")
     else:
-        print("ℹNo new sensors to insert.")
+        print("No new sensors to insert.")
 
     # Prepare and clean measurements
     measurements_df = df[["sensor_id", "timestamp", "water_level", "filtered_water_level"]]
