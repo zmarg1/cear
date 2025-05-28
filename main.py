@@ -26,7 +26,7 @@ def download_data():
     else:
         print(f"Failed to download file. Status code: {response.status_code}")
 
-def load_and_explore_data(csv_path):
+def explore_data(csv_path):
     try:
         df = pd.read_csv(csv_path)
         print("Data loaded successfully.\n")
@@ -69,11 +69,6 @@ def populate_database(csv_path="raw_data/all_sensor_data.csv", db_path="sea_leve
         .reset_index()
         .rename(columns={"desc": "description", "lat": "latitude", "lon": "longitude"})
     )
-
-    print(f"\nCleaned to {len(sensors_df)} unique sensors.")
-
-    print("\nListing unique sensors:")
-    print(sensors_df.sort_values("sensor_id").to_string(index=False))
 
     # Connect to the SQLite DB
     conn = sqlite3.connect(db_path)
@@ -179,7 +174,7 @@ def explor_location_differences(df, sensor_ids):
 
         print("  Water level stats by location:")
         print(level_stats.round(3))
-        
+
 if __name__ == "__main__":
     sensor_data_path = os.path.join("raw_data", "all_sensor_data.csv")
     df = pd.read_csv(sensor_data_path)
