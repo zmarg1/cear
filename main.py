@@ -1,182 +1,150 @@
-import os
-import requests
-import pandas as pd
 import sqlite3
+import requests
+import json
 from tqdm import tqdm
 
-DATA_URL = "https://www.dropbox.com/s/a3qivjdpc30aqg1/all_sensor_data.csv?dl=1"
+DB_PATH = "cear.db"
+BASE_URL = "https://api.sealevelsensors.org/v1.0"
 
-def download_data():
-    url = DATA_URL
-    output_dir = "raw_data"
-    output_filename = "sea_level_data.csv"
-    output_path = os.path.join(output_dir, output_filename)
+# Step 1: Create database and tables
+def create_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS api_locations (
+        location_id INTEGER PRIMARY KEY,
+        name TEXT,
+        description TEXT,
+        latitude REAL,
+        longitude REAL
+    );
 
-    # Create the directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
+    CREATE TABLE IF NOT EXISTS api_sensors (
+        sensor_id INTEGER PRIMARY KEY,
+        name TEXT,
+        description TEXT,
+        location_id INTEGER,
+        FOREIGN KEY (location_id) REFERENCES api_locations(location_id)
+    );
 
-    print(f"Downloading from {url}")
-    response = requests.get(url, stream=True)
+    CREATE TABLE IF NOT EXISTS api_datastreams (
+        datastream_id INTEGER PRIMARY KEY,
+        sensor_id INTEGER,
+        name TEXT,
+        unit_of_measurement TEXT,
+        notes TEXT,
+        FOREIGN KEY (sensor_id) REFERENCES api_sensors(sensor_id)
+    );
 
-    if response.status_code == 200:
-        with open(output_path, 'wb') as file:
-            for chunk in response.iter_content(chunk_size=8192):
-                file.write(chunk)
-        print(f"Download complete: {output_path}")
-    else:
-        print(f"Failed to download file. Status code: {response.status_code}")
-
-def explore_data(csv_path):
-    try:
-        df = pd.read_csv(csv_path)
-        print("Data loaded successfully.\n")
-
-        print("First 5 rows:")
-        print(df.head(), end="\n\n")
-
-        print("DataFrame shape (rows, columns):")
-        print(df.shape, end="\n\n")
-
-        print("Column names:")
-        print(df.columns.tolist(), end="\n\n")
-
-        print("Missing values per column:")
-        print(df.isnull().sum(), end="\n\n")
-
-        print("Data types:")
-        print(df.dtypes, end="\n\n")
-
-        print("Descriptive statistics:")
-        print(df.describe(include='all'), end="\n\n")
-
-    except Exception as e:
-        print(f"Failed to load or analyze CSV. Error: {e}")
-
-def populate_database(csv_path="raw_data/sea_level_data.csv", db_path="cear.db"):
-    print("Loading data from CSV...")
-    df = pd.read_csv(csv_path)
-
-    # Convert timestamp and clean up
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-    df["sensor_id"] = df["ID"].astype(int)
-    df["lat"] = df["lat"].round(6)
-    df["lon"] = df["lon"].round(6)
-
-    # Clean sensors_df
-    sensors_df = (
-        df.groupby("sensor_id")[["desc", "lat", "lon"]]
-        .first()
-        .reset_index()
-        .rename(columns={"desc": "description", "lat": "latitude", "lon": "longitude"})
-    )
-
-    # Connect to the SQLite DB
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    # Load existing sensor IDs from DB
-    cursor.execute("SELECT sensor_id FROM sensors")
-    existing_ids = set(row[0] for row in cursor.fetchall())
-
-    # Filter new sensors only
-    new_sensors_df = sensors_df[~sensors_df["sensor_id"].isin(existing_ids)]
-
-    if not new_sensors_df.empty:
-        new_sensors_df.to_sql("sensors", conn, if_exists="append", index=False)
-        print(f"Inserted {len(new_sensors_df)} new sensors.")
-    else:
-        print("No new sensors to insert.")
-
-    # Prepare and clean measurements
-    measurements_df = df[["sensor_id", "timestamp", "water_level", "filtered_water_level"]]
-    measurements_df.columns = ["sensor_id", "timestamp", "water_level", "filtered_level"]
-    measurements_df = measurements_df.dropna(subset=["timestamp"])
-
-    print(f"\nMeasurements to insert: {len(measurements_df)} rows.")
-
-    # Insert measurements with progress bar
-    print("Inserting measurements (this may take a while)...")
-    chunksize = 50000
-    total_chunks = (len(measurements_df) + chunksize - 1) // chunksize
-
-    for i in tqdm(range(total_chunks), desc="Inserting measurements"):
-        start = i * chunksize
-        end = min(start + chunksize, len(measurements_df))
-        measurements_df.iloc[start:end].to_sql("measurements", conn, if_exists="append", index=False)
-
-    print("Measurements inserted successfully.")
-    conn.close()
-
-def reset_database(db_path="cear.db"):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute("DROP VIEW IF EXISTS daily_sensor_stats;")
-    cursor.execute("DROP TABLE IF EXISTS measurements;")
-    cursor.execute("DROP TABLE IF EXISTS sensors;")
-    cursor.execute("DROP TABLE IF EXISTS events;")
+    CREATE TABLE IF NOT EXISTS api_observations (
+        observation_id INTEGER PRIMARY KEY,
+        datastream_id INTEGER,
+        result_time TEXT,
+        result REAL,
+        sensor_id INTEGER,
+        FOREIGN KEY (datastream_id) REFERENCES api_datastreams(datastream_id),
+        FOREIGN KEY (sensor_id) REFERENCES api_sensors(sensor_id)
+    );
+    """)
     conn.commit()
     conn.close()
-    print("Database tables dropped.")
 
-def explore_sensor_conflicts(df):
-    print("\nExploring sensor_id metadata conflicts...")
+# Step 2: Fetch all sensors
+def fetch_sensors():
+    response = requests.get(f"{BASE_URL}/Things?$top=1000")
+    response.raise_for_status()
+    return response.json()["value"]
 
-    grouped = df.groupby("ID")
+# Step 3: Fetch location info for a sensor
+def fetch_location(sensor_id):
+    response = requests.get(f"{BASE_URL}/Things({sensor_id})/Locations")
+    response.raise_for_status()
+    locations = response.json()["value"]
+    if not locations:
+        return None
+    loc = locations[0]
+    coordinates = loc.get("location", {}).get("coordinates", [None, None])
+    return {
+        "location_id": loc["@iot.id"],
+        "name": loc["name"],
+        "description": loc["description"],
+        "latitude": coordinates[1],
+        "longitude": coordinates[0]
+    }
 
-    conflicting_sensors = []
+# Step 4: Fetch datastreams for a sensor
+def fetch_datastreams(sensor_id):
+    response = requests.get(f"{BASE_URL}/Things({sensor_id})/Datastreams")
+    response.raise_for_status()
+    return response.json()["value"]
 
-    for sensor_id, group in grouped:
-        unique_desc = group["desc"].nunique()
-        unique_lat = group["lat"].nunique()
-        unique_lon = group["lon"].nunique()
+# Step 5: Fetch latest 100 observations for a datastream
+def fetch_observations(datastream_id, sensor_id):
+    url = f"{BASE_URL}/Datastreams({datastream_id})/Observations?$select=resultTime,result&$top=100"
+    response = requests.get(url)
+    response.raise_for_status()
+    return [
+        {
+            "datastream_id": datastream_id,
+            "sensor_id": sensor_id,
+            "result_time": obs["resultTime"],
+            "result": obs["result"]
+        }
+        for obs in response.json().get("value", [])
+    ]
 
-        if unique_desc > 1 or unique_lat > 1 or unique_lon > 1:
-            conflicting_sensors.append({
-                "sensor_id": int(sensor_id),
-                "desc_count": unique_desc,
-                "lat_count": unique_lat,
-                "lon_count": unique_lon
-            })
+# Step 6: Populate database
+def populate_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    sensors = fetch_sensors()
 
-    if conflicting_sensors:
-        print(f"Found {len(conflicting_sensors)} sensor_id(s) with conflicting metadata:")
-        for conflict in conflicting_sensors:
-            print(conflict)
-    else:
-        print("No sensor_id conflicts found. All metadata consistent.")
+    for sensor in tqdm(sensors, desc="Processing sensors"):
+        sensor_id = sensor["@iot.id"]
+        sensor_name = sensor["name"]
+        description = sensor["description"]
 
-def get_conflicting_sensors(df):
-    """Returns list of sensor IDs with >1 unique lat/lon value."""
-    conflicting_ids = []
+        # Location
+        loc = fetch_location(sensor_id)
+        if loc:
+            c.execute("""INSERT OR IGNORE INTO api_locations 
+                         (location_id, name, description, latitude, longitude)
+                         VALUES (?, ?, ?, ?, ?)""",
+                      (loc["location_id"], loc["name"], loc["description"], loc["latitude"], loc["longitude"]))
+            location_id = loc["location_id"]
+        else:
+            location_id = None
 
-    grouped = df.groupby("ID")
-    for sensor_id, group in grouped:
-        if group["lat"].nunique() > 1 or group["lon"].nunique() > 1:
-            conflicting_ids.append(int(sensor_id))  # Convert from float to int
+        # Sensor
+        c.execute("""INSERT OR IGNORE INTO api_sensors 
+                     (sensor_id, name, description, location_id)
+                     VALUES (?, ?, ?, ?)""",
+                  (sensor_id, sensor_name, description, location_id))
 
-    return conflicting_ids
+        # Datastreams
+        datastreams = fetch_datastreams(sensor_id)
+        for ds in datastreams:
+            ds_id = ds["@iot.id"]
+            ds_name = ds["name"]
+            unit = ds.get("unitOfMeasurement", {}).get("name", None)
+            notes = ds.get("description", "")
 
-def explor_location_differences(df, sensor_ids):
-    """Prints distinct locations and water level stats for each conflicting sensor ID."""
-    for sensor_id in sensor_ids:
-        print(f"\nSensor ID: {sensor_id}")
-        subset = df[df["ID"] == sensor_id]
+            c.execute("""INSERT OR IGNORE INTO api_datastreams 
+                         (datastream_id, sensor_id, name, unit_of_measurement, notes)
+                         VALUES (?, ?, ?, ?, ?)""",
+                      (ds_id, sensor_id, ds_name, unit, notes))
 
-        locs = subset[["lat", "lon"]].drop_duplicates()
-        print(f"  Unique locations ({len(locs)}):")
-        print(locs)
+            # Observations (just 100 for now)
+            observations = fetch_observations(ds_id, sensor_id)
+            for obs in observations:
+                c.execute("""INSERT OR IGNORE INTO api_observations 
+                             (datastream_id, sensor_id, result_time, result)
+                             VALUES (?, ?, ?, ?)""",
+                          (obs["datastream_id"], obs["sensor_id"], obs["result_time"], obs["result"]))
 
-        level_stats = (
-            subset.groupby(["lat", "lon"])["water_level"]
-            .describe()[["mean", "std", "min", "max"]]
-            .reset_index()
-        )
-
-        print("  Water level stats by location:")
-        print(level_stats.round(3))
+        conn.commit()
+    conn.close()
 
 if __name__ == "__main__":
-    sensor_data_path = os.path.join("raw_data", "sea_level_data.csv")
-    df = pd.read_csv(sensor_data_path)
-    populate_database()
-
+    create_db()
+    populate_db()
