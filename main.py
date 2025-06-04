@@ -2,6 +2,7 @@ import sqlite3
 import requests
 import json
 from tqdm import tqdm
+import pandas as pd
 
 DB_PATH = "cear.db"
 BASE_URL = "https://api.sealevelsensors.org/v1.0"
@@ -145,6 +146,80 @@ def populate_db():
         conn.commit()
     conn.close()
 
+def view_sensor_data(sensor_id):
+    conn = sqlite3.connect(DB_PATH)
+
+    # Get sensor details
+    sensor_query = """
+    SELECT s.sensor_id, s.name, s.description, l.name AS location_name, l.latitude, l.longitude
+    FROM api_sensors s
+    LEFT JOIN api_locations l ON s.location_id = l.location_id
+    WHERE s.sensor_id = ?
+    """
+    sensor_info = pd.read_sql(sensor_query, conn, params=(sensor_id,))
+    print("Sensor Info:")
+    print(sensor_info.to_string(index=False), end="\n\n")
+
+    # Get observations for that sensor
+    obs_query = """
+    SELECT o.result_time, o.result, d.name AS datastream_name
+    FROM api_observations o
+    JOIN api_datastreams d ON o.datastream_id = d.datastream_id
+    WHERE o.sensor_id = ?
+    ORDER BY o.result_time ASC
+    LIMIT 10
+    """
+    observations = pd.read_sql(obs_query, conn, params=(sensor_id,))
+    print("First 10 Observations:")
+    print(observations)
+
+    conn.close()
+
+def view_location_data(location_id=None):
+    conn = sqlite3.connect(DB_PATH)
+
+    # If a specific location_id is given, filter by it
+    location_query = """
+    SELECT location_id, name, description, latitude, longitude
+    FROM api_locations
+    {}
+    ORDER BY location_id
+    """.format("WHERE location_id = ?" if location_id else "")
+
+    if location_id:
+        locations = pd.read_sql(location_query, conn, params=(location_id,))
+    else:
+        locations = pd.read_sql(location_query, conn)
+
+    print("Location Info:")
+    print(locations.to_string(index=False), end="\n\n")
+
+    # Get sensors associated with the location(s)
+    sensors_query = """
+    SELECT s.sensor_id, s.name, s.description, s.location_id
+    FROM api_sensors s
+    {}
+    ORDER BY s.sensor_id
+    """.format("WHERE s.location_id = ?" if location_id else "")
+
+    if location_id:
+        sensors = pd.read_sql(sensors_query, conn, params=(location_id,))
+    else:
+        sensors = pd.read_sql(sensors_query, conn)
+
+    print("Sensors at Location{}:".format(f" {location_id}" if location_id else "s"))
+    print(sensors.to_string(index=False))
+
+    conn.close()
+
+
+
 if __name__ == "__main__":
-    create_db()
-    populate_db()
+    #create_db()
+    #populate_db()
+    sensor_id_to_test = 3  # Change this to test different sensor IDs
+    view_sensor_data(sensor_id_to_test)
+
+    # Optionally set a specific location_id to inspect (e.g., 5)
+    location_id_to_test = None  # Set to an int to filter, or leave as None for all
+    view_location_data(location_id_to_test)
