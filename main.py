@@ -5,22 +5,111 @@ from tqdm import tqdm
 import pandas as pd
 from datetime import datetime, timedelta
 import sys
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 DB_PATH = "cear.db"
 BASE_URL = "https://api.sealevelsensors.org/v1.0"
-OBSERVATION_LIMIT = 7000
+OBSERVATION_LIMIT = 10000
 BATCH_SIZE = 1000
+
+# Global session with retries and backoff
+session = requests.Session()
+
+retries = Retry(
+    total=5,  # retry up to 5 times
+    backoff_factor=1,  # wait 1s, 2s, 4s, etc.
+    status_forcelist=[500, 502, 503, 504, 429],  # server or rate limit errors
+    allowed_methods=["HEAD", "GET", "OPTIONS"],  # safe to retry GET requests
+    raise_on_status=False
+)
+
+adapter = HTTPAdapter(max_retries=retries)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
 
 # ---- Helpers ----
 
+def list_datastreams_for_thing(thing_id: int) -> list[tuple[int, str]]:
+    """Return a numbered list of (datastream_id, datastream_name) for a Thing."""
+    datastreams = fetch_datastreams(thing_id)
+    numbered_list = []
+
+    print(f"\nDatastreams for Thing {thing_id}:\n")
+    for i, ds in enumerate(datastreams, start=1):
+        ds_id = ds["@iot.id"]
+        ds_name = ds.get("name", f"Datastream {ds_id}")
+        print(f"{i:2}. {ds_name}")
+        numbered_list.append((ds_id, ds_name))
+
+    return numbered_list
+
+def normalize_start_time_input(user_input: str) -> str | None:
+    """Normalize user input for start time to full ISO format, or None if blank."""
+    user_input = user_input.strip()
+    if not user_input:
+        return None  # user pressed Enter → start from oldest
+
+    # If user enters YYYY-MM-DD → convert to full ISO
+    if len(user_input) == 10 and user_input.count("-") == 2:
+        return user_input + "T00:00:00Z"
+
+    # Otherwise assume they entered full ISO → use as is
+    return user_input
+
+def get_datastream_time_range(ds_id: int) -> tuple[str, str]:
+    """Return (oldest_time, newest_time) for a Datastream via API."""
+    try:
+        oldest_obs = get_api_data(f"/Datastreams({ds_id})/Observations?$orderby=phenomenonTime asc&$top=1")["value"]
+        oldest_time = oldest_obs[0]["phenomenonTime"] if oldest_obs else None
+    except Exception as e:
+        oldest_time = None
+
+    try:
+        newest_obs = get_api_data(f"/Datastreams({ds_id})/Observations?$orderby=phenomenonTime desc&$top=1")["value"]
+        newest_time = newest_obs[0]["phenomenonTime"] if newest_obs else None
+    except Exception as e:
+        newest_time = None
+
+    return oldest_time, newest_time
+
+def get_api_data(path, timeout=10):
+    """GET data from API with retries and timeout."""
+    url = BASE_URL + path
+    try:
+        response = session.get(url, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Error during API call: {url}\n→ {e}")
+        raise
+
+def get_datastream_metadata(ds_id: int) -> dict:
+    """Fetch Datastream name, ObservedProperty, Sensor, and total observation count."""
+    ds = fetch_datastream_full(ds_id)
+
+    # Get ObservedProperty name
+    op_link = ds["ObservedProperty@iot.navigationLink"]
+    op = fetch_observed_property_from_link(op_link)
+
+    # Get Sensor name
+    sensor_link = ds["Sensor@iot.navigationLink"]
+    sensor = fetch_sensor_from_link(sensor_link)
+
+    # Get Observation count
+    count_url = f"/Datastreams({ds_id})/Observations?$top=0&$count=true"
+    count_response = get_api_data(count_url)
+    obs_count = count_response.get("@iot.count", "?")  # fallback in case not returned
+
+    return {
+        "datastream_name": ds.get("name", f"Datastream {ds_id}"),
+        "observed_property_name": op.get("name", "(unknown)"),
+        "sensor_name": sensor.get("name", "(unknown)"),
+        "observation_count": obs_count
+    }
+
 def safe_print(*args, **kwargs):
     tqdm.write(" ".join(str(a) for a in args), file=sys.stdout, **kwargs)
-
-def get_api_data(path):
-    url = BASE_URL + path
-    response = requests.get(url)
-    response.raise_for_status()
-    return response.json()
 
 def parse_interval(val):
     if isinstance(val, dict):
@@ -90,7 +179,7 @@ def insert_observations(conn, c, datastream_id, observations, batch_size):
         # Commit every batch_size
         if count_since_commit >= batch_size:
             conn.commit()
-            print(f"Committed {count_since_commit} observations so far for Datastream {datastream_id}.")
+            safe_print(f"Committed {count_since_commit} observations so far for Datastream {datastream_id}.")
             count_since_commit = 0
 
     # Final commit for any remaining
@@ -98,6 +187,55 @@ def insert_observations(conn, c, datastream_id, observations, batch_size):
         conn.commit()
         print(f"Final commit of {count_since_commit} observations for Datastream {datastream_id}.")
 
+
+def show_thing_observation_ranges(thing_id: int):
+    """Show oldest and most recent observation date for each Datastream in a Thing (compare API vs DB)."""
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    print(f"\nThing {thing_id} → Observation ranges per Datastream (API vs DB)\n")
+
+    datastreams = fetch_datastreams(thing_id)
+
+    for ds in datastreams:
+        ds_id = ds["@iot.id"]
+        ds_name = ds.get("name", f"Datastream {ds_id}")
+
+        # --- API oldest ---
+        try:
+            oldest_obs = get_api_data(f"/Datastreams({ds_id})/Observations?$orderby=phenomenonTime asc&$top=1")["value"]
+            oldest_api_time = oldest_obs[0]["phenomenonTime"] if oldest_obs else "(no observations)"
+        except Exception as e:
+            oldest_api_time = f"(error: {e})"
+
+        # --- API newest ---
+        try:
+            newest_obs = get_api_data(f"/Datastreams({ds_id})/Observations?$orderby=phenomenonTime desc&$top=1")["value"]
+            newest_api_time = newest_obs[0]["phenomenonTime"] if newest_obs else "(no observations)"
+        except Exception as e:
+            newest_api_time = f"(error: {e})"
+
+        # --- DB oldest ---
+        c.execute("""
+            SELECT MIN(phenomenon_time_start) FROM observations WHERE datastream_id = ?;
+        """, (ds_id,))
+        oldest_db_time = c.fetchone()[0] or "(no observations)"
+
+        # --- DB newest ---
+        c.execute("""
+            SELECT MAX(phenomenon_time_start) FROM observations WHERE datastream_id = ?;
+        """, (ds_id,))
+        newest_db_time = c.fetchone()[0] or "(no observations)"
+
+        # --- Print result ---
+        print(f"\nDatastream {ds_id} → {ds_name}")
+        print(f"Oldest observation in API    : {oldest_api_time}")
+        print(f"Oldest observation in DB     : {oldest_db_time}")
+        print(f"Most recent observation in API: {newest_api_time}")
+        print(f"Most recent observation in DB : {newest_db_time}")
+
+    conn.close()
 
 # Step 1: Create database and tables
 def create_db():
@@ -266,19 +404,17 @@ def fetch_all_observations(datastream_id: int, page_size=1000, after_time=None, 
     skip = 0
     fetched = 0
 
-    print(f"Datastream {datastream_id} → Fallback fetching observations...")
     pbar = tqdm(desc=f"Datastream {datastream_id} Fallback paging", unit="obs")
 
     while True:
         params = {
             "$top": page_size,
             "$skip": skip,
-            "$orderby": "phenomenonTime asc"
+            "$orderby": "phenomenonTime desc"
         }
 
-        if after_time:
-            params["$filter"] = f"phenomenonTime gt {repr(after_time)}"
-
+        # Do NOT use $filter in fallback mode — avoid the API errors
+        # (previous after_time is already known — filter manually if needed after fetch)
         url = f"{BASE_URL}/Datastreams({datastream_id})/Observations"
 
         response = requests.get(url, params=params)
@@ -291,14 +427,16 @@ def fetch_all_observations(datastream_id: int, page_size=1000, after_time=None, 
         observations.extend(page)
         fetched += len(page)
         skip += page_size
-
-        # Update progress bar
         pbar.update(len(page))
 
-        # Optional limit safeguard
         if limit and fetched >= limit:
             pbar.close()
             return observations[:limit]
+    
+    # If using reverse order (most recent first), reverse for insert to DB consistency
+    if limit:
+        observations = observations[:limit]
+    observations = list(reversed(observations))
 
     pbar.close()
     return observations
@@ -310,137 +448,6 @@ def parse_time_range(field):
         start, end = field.split("/")
         return start, end
     return None, None
-
-def populate_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    # Step 1: Fetch all Things
-    things = fetch_things()
-
-    for thing in tqdm(things, desc="Processing Things"):
-        thing_id = thing["@iot.id"]
-        c.execute("""INSERT OR IGNORE INTO things 
-                     (thing_id, name, description, properties)
-                     VALUES (?, ?, ?, ?)""",
-                  (thing_id, thing["name"], thing.get("description", ""), 
-                   json.dumps(thing.get("properties", {}))))
-
-        # Step 2: Fetch Locations
-        locations = fetch_locations(thing_id)
-        for loc in tqdm(locations, desc=f"Thing {thing_id} Locations", leave=False):
-            location_id = loc["@iot.id"]
-            c.execute("""INSERT OR IGNORE INTO locations 
-                         (location_id, name, description, encoding_type, location, properties)
-                         VALUES (?, ?, ?, ?, ?, ?)""",
-                      (location_id, loc["name"], loc.get("description", ""), loc["encodingType"],
-                       json.dumps(loc["location"]), json.dumps(loc.get("properties", {}))))
-            c.execute("""INSERT OR IGNORE INTO thing_locations 
-                         (thing_id, location_id)
-                         VALUES (?, ?)""",
-                      (thing_id, location_id))
-
-        # Step 3: Fetch HistoricalLocations
-        historical_locations = fetch_historical_locations(thing_id)
-        for hl in tqdm(historical_locations, desc=f"Thing {thing_id} HistoricalLocations", leave=False):
-            hl_id = hl["@iot.id"]
-            c.execute("""INSERT OR IGNORE INTO historical_locations 
-                         (historical_location_id, thing_id, time)
-                         VALUES (?, ?, ?)""",
-                      (hl_id, thing_id, hl["time"]))
-
-            for loc in hl.get("Locations", []):
-                location_id = loc["@iot.id"]
-                c.execute("""INSERT OR IGNORE INTO locations 
-                             (location_id, name, description, encoding_type, location, properties)
-                             VALUES (?, ?, ?, ?, ?, ?)""",
-                          (location_id, loc["name"], loc.get("description", ""), loc["encodingType"],
-                           json.dumps(loc["location"]), json.dumps(loc.get("properties", {}))))
-                c.execute("""INSERT OR IGNORE INTO historical_location_locations 
-                             (historical_location_id, location_id)
-                             VALUES (?, ?)""",
-                          (hl_id, location_id))
-
-        # Step 4: Fetch Datastreams
-        datastreams = fetch_datastreams(thing_id)
-        for ds in tqdm(datastreams, desc=f"Thing {thing_id} Datastreams", leave=False):
-            ds_id = ds["@iot.id"]
-
-            # Step 5: Fetch full Datastream once (optimized!)
-            ds_full = fetch_datastream_full(ds_id)
-            sensor_link = ds_full["Sensor@iot.navigationLink"]
-            op_link = ds_full["ObservedProperty@iot.navigationLink"]
-
-            # Step 6: Fetch Sensor
-            sensor = fetch_sensor_from_link(sensor_link)
-            c.execute("""INSERT OR IGNORE INTO sensors 
-                         (sensor_id, name, description, encoding_type, metadata, properties)
-                         VALUES (?, ?, ?, ?, ?, ?)""",
-                      (sensor["@iot.id"], sensor["name"], sensor.get("description", ""),
-                       sensor["encodingType"], sensor.get("metadata", ""), json.dumps(sensor.get("properties", {}))))
-
-            # Step 7: Fetch ObservedProperty
-            op = fetch_observed_property_from_link(op_link)
-            c.execute("""INSERT OR IGNORE INTO observed_properties 
-                         (observed_property_id, name, description, definition, properties)
-                         VALUES (?, ?, ?, ?, ?)""",
-                      (op["@iot.id"], op["name"], op.get("description", ""), op["definition"], 
-                       json.dumps(op.get("properties", {}))))
-
-            # Insert Datastream
-            uom = ds_full.get("unitOfMeasurement", {})
-            pheno_start, pheno_end = parse_time_range(ds_full.get("phenomenonTime", ""))
-            result_start, result_end = parse_time_range(ds_full.get("resultTime", ""))
-
-            c.execute("""INSERT OR IGNORE INTO datastreams 
-                         (datastream_id, thing_id, sensor_id, observed_property_id, name, description, observation_type,
-                          unit_of_measurement_name, unit_of_measurement_symbol, unit_of_measurement_definition,
-                          observed_area, phenomenon_time_start, phenomenon_time_end, result_time_start, result_time_end, properties)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                      (ds_id, thing_id, sensor["@iot.id"], op["@iot.id"], ds_full["name"], ds_full.get("description", ""),
-                       ds_full["observationType"], uom.get("name", ""), uom.get("symbol", ""), uom.get("definition", ""),
-                       json.dumps(ds_full.get("observedArea", None)),
-                       pheno_start, pheno_end, result_start, result_end,
-                       json.dumps(ds_full.get("properties", {}))))
-
-            # Step 8a: Fetch ALL Observations with paging
-            observations = fetch_new_observations(ds_id, conn)
-
-            for obs in tqdm(observations, desc=f"Datastream {ds_id} Observations", leave=False):
-                obs_id = obs["@iot.id"]
-
-                # Step 8b: Fetch FeatureOfInterest
-                foi = fetch_feature_of_interest(obs_id)
-                c.execute("""INSERT OR IGNORE INTO features_of_interest 
-                             (feature_of_interest_id, name, description, encoding_type, feature, properties)
-                             VALUES (?, ?, ?, ?, ?, ?)""",
-                          (foi["@iot.id"], foi["name"], foi.get("description", ""), foi["encodingType"],
-                           json.dumps(foi["feature"]), json.dumps(foi.get("properties", {}))))
-
-                phenomenon_start, phenomenon_end = parse_interval(obs.get("phenomenonTime"))
-                valid_start, valid_end = parse_interval(obs.get("validTime"))
-
-                # Insert Observation
-                c.execute("""INSERT OR IGNORE INTO observations 
-                    (observation_id, datastream_id, phenomenon_time_start, phenomenon_time_end,
-                    result_time, result, result_quality, valid_time_start, valid_time_end, parameters, feature_of_interest_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (obs_id, ds_id,
-                    phenomenon_start,
-                    phenomenon_end,
-                    obs.get("resultTime", None),
-                    json.dumps(obs.get("result", None)),
-                    json.dumps(obs.get("resultQuality", [])),
-                    valid_start,
-                    valid_end,
-                    json.dumps(obs.get("parameters", {})),
-                    foi["@iot.id"]))
-
-        # Commit per Thing
-        conn.commit()
-
-    conn.close()
-    print("Database populated successfully.")
 
 def list_things() -> list:
     """
@@ -527,10 +534,57 @@ def populate_single_thing(thing_id: int):
         for ds in tqdm(datastreams, desc=f"Thing {thing_id} Datastreams"):
             ds_id = ds["@iot.id"]
 
-            # Fetch full Datastream once
+            # Get metadata
+            meta = get_datastream_metadata(ds_id)
+
+            # Count existing observations in DB
+            c.execute("""SELECT COUNT(*) FROM observations WHERE datastream_id = ?;""", (ds_id,))
+            existing_obs_count = c.fetchone()[0]
+
+            # Print clean summary
+            print(f"\n--- Processing Datastream {ds_id} ---")
+            print(f"Name: {meta['datastream_name']}")
+            print(f"Observed Property: {meta['observed_property_name']}")
+            print(f"Sensor: {meta['sensor_name']}")
+            print(f"Total Observations in API: {meta['observation_count']}")
+            print(f"Total Observations already in DB: {existing_obs_count}")
+            # Show observation time range
+            oldest_api_time, newest_api_time = get_datastream_time_range(ds_id)
+            print(f"Oldest observation in API    : {oldest_api_time or '(no observations)'}")
+            print(f"Most recent observation in API: {newest_api_time or '(no observations)'}")
+
+            # Ask user whether to fetch this Datastream
+            while True:
+                user_input = input("Fetch this Datastream? (y/n): ").strip().lower()
+                if user_input in ("y", "n"):
+                    break
+                print("Please enter 'y' or 'n'.")
+
+            if user_input == "n":
+                print(f"Skipping Datastream {ds_id}.")
+                continue  # skip this datastream
+
+            # Ask for start time
+            start_time_input = input(f"From what observation time would you like to start? (Enter YYYY-MM-DD or full ISO, Enter for oldest): ").strip()
+            start_time = normalize_start_time_input(start_time_input)
+
+            # Then ask for limit
+            obs_limit_input = input(f"How many observations to fetch from this point forward? (Enter for ALL): ").strip()
+            obs_limit = int(obs_limit_input) if obs_limit_input.isdigit() else None
+            
+            print(f"→ Will fetch up to {obs_limit if obs_limit else 'ALL'} observations starting from {start_time or 'oldest'}.\n")
+
+            # Now proceed — Fetch full Datastream (required for DB insert)
             ds_full = fetch_datastream_full(ds_id)
             sensor_link = ds_full["Sensor@iot.navigationLink"]
             op_link = ds_full["ObservedProperty@iot.navigationLink"]
+
+            # Fetch new observations ONCE
+            observations, latest_db_time = fetch_new_observations(ds_id, conn, limit=obs_limit, start_time=start_time)
+
+            # Print latest time AFTER fetch — this is perfectly fine
+            safe_print(f"Latest Observation in DB after fetch: {latest_db_time}")
+
 
             # Sensor
             sensor = fetch_sensor_from_link(sensor_link)
@@ -564,8 +618,7 @@ def populate_single_thing(thing_id: int):
                     pheno_start, pheno_end, result_start, result_end,
                     json.dumps(ds_full.get("properties", {}))))
 
-            # Observations
-            observations, latest_db_time = fetch_new_observations(ds_id, conn)
+            # Insert observations — reuse previously fetched observations
             insert_observations(conn, c, ds_id, observations, batch_size=BATCH_SIZE)
 
             print(f"Finished Datastream {ds_id}.")
@@ -623,7 +676,7 @@ def is_thing_up_to_date(thing_id: int, conn, page_size=1) -> bool:
     return True
 
 
-def fetch_new_observations(datastream_id: int, conn, page_size=1000, limit=None) -> tuple[list, str]:
+def fetch_new_observations(datastream_id: int, conn, page_size=1000, limit=None, start_time=None) -> tuple[list, str]:
     """
     Fetch only new Observations for a Datastream:
     - Check the DB for latest phenomenon_time_start
@@ -644,7 +697,11 @@ def fetch_new_observations(datastream_id: int, conn, page_size=1000, limit=None)
     if latest_time and "." in latest_time:
         latest_time = latest_time.split(".")[0] + "Z"
 
-    safe_print(f"Datastream {datastream_id} → Latest DB time: {latest_time}")
+    # Always print this once — outside loop
+    if latest_time:
+        safe_print(f"Datastream {datastream_id} → Latest DB time: {latest_time}")
+    else:
+        safe_print(f"Datastream {datastream_id} → No existing DB observations → fetching all.")
 
     # Step 2: Setup paging
     observations = []
@@ -656,17 +713,15 @@ def fetch_new_observations(datastream_id: int, conn, page_size=1000, limit=None)
             params = {
                 "$top": page_size,
                 "$skip": skip,
-                "$orderby": "phenomenonTime asc"
+                "$orderby": "phenomenonTime desc"
             }
 
-            # Some APIs are picky about microseconds, so you can truncate them safely if needed:
-            if latest_time.endswith("Z"):
-                filter_time = latest_time
-            else:
-                filter_time = latest_time + "Z"
-
-            params["$filter"] = f"phenomenonTime gt {filter_time}"
-
+            if start_time:
+                start_time_for_filter = start_time[:-1] if start_time.endswith("Z") else start_time
+                params["$filter"] = f"phenomenonTime ge datetime'{start_time_for_filter}'"
+            elif latest_time:
+                latest_time_for_filter = latest_time[:-1] if latest_time.endswith("Z") else latest_time
+                params["$filter"] = f"phenomenonTime gt datetime'{latest_time_for_filter}'"
 
             url = f"{BASE_URL}/Datastreams({datastream_id})/Observations"
 
@@ -683,12 +738,30 @@ def fetch_new_observations(datastream_id: int, conn, page_size=1000, limit=None)
 
             if limit and fetched >= limit:
                 return observations[:limit], latest_time
+        
+        # If using reverse order (most recent first), reverse for insert to DB consistency
+        if limit:
+            observations = observations[:limit]
+        observations = list(reversed(observations))
 
     except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 500:
-            print("⚠️ 500 Error on filtered query → falling back to fetch ALL observations and filter in Python.")
-            observations = fetch_all_observations(datastream_id, after_time=latest_time, limit=limit)
-            print(f"Fallback fetched {len(observations)} new observations.")
+        if e.response.status_code in [400, 500]:
+            print(f"⚠️ {e.response.status_code} Error on filtered query → falling back to fetch ALL observations and filter in Python.")
+            print(f"Datastream {datastream_id} → Fallback fetching observations...")
+            # Fallback → fetch all
+            observations = fetch_all_observations(datastream_id, after_time=start_time, limit=limit)
+
+            # Manual filtering
+            if latest_time:
+                filtered_observations = []
+                for obs in observations:
+                    obs_time = obs["phenomenonTime"]
+                    if obs_time > latest_time:
+                        filtered_observations.append(obs)
+                observations = filtered_observations
+                print(f"Fallback fetched {len(observations)} new observations after filtering.")
+            else:
+                print(f"Fallback fetched {len(observations)} new observations.")
         else:
             raise  # Re-raise other errors
 
@@ -780,9 +853,10 @@ if __name__ == "__main__":
     while True:
         print("\nOptions:")
         print("  V        → View database contents")
-        print("  C        → Check if selected Thing is up to date")
+        print("  C        → Check if selected Thing's Datastream is up to date")
         print("  D        → Delete selected Thing from database")
         print("  L        → List available Things again")
+        print("  R        → Show observation ranges for selected Thing")
         print("  [number] → Populate selected Location / Thing")
         print("  Q        → Quit")
 
@@ -803,15 +877,57 @@ if __name__ == "__main__":
             index = int(check_choice) - 1
             thing_id, thing_name, loc_name = numbered_list[index]
 
-            print(f"\nChecking if Thing {thing_id} → {thing_name} → {loc_name} is up to date...\n")
-            conn = sqlite3.connect(DB_PATH)
-            up_to_date = is_thing_up_to_date(thing_id, conn)
-            conn.close()
+            # List Datastreams
+            ds_numbered_list = list_datastreams_for_thing(thing_id)
 
-            if up_to_date:
-                print(f"Thing {thing_id} → {thing_name} is up to date.")
+            # Prompt user to check one or all
+            print("\nEnter Datastream number to check, or 'A' to check ALL Datastreams.")
+            ds_choice = input("Your choice: ").strip().lower()
+
+            conn = sqlite3.connect(DB_PATH)
+
+            if ds_choice == "a":
+                print(f"\nChecking if Thing {thing_id} → {thing_name} → {loc_name} is up to date...\n")
+                up_to_date = is_thing_up_to_date(thing_id, conn)
+                if up_to_date:
+                    print(f"Thing {thing_id} → {thing_name} is up to date.")
+                else:
+                    print(f"Thing {thing_id} → {thing_name} has new data in API.")
+            elif ds_choice.isdigit() and (1 <= int(ds_choice) <= len(ds_numbered_list)):
+                ds_index = int(ds_choice) - 1
+                ds_id, ds_name = ds_numbered_list[ds_index]
+
+                print(f"\nChecking Datastream {ds_id} → {ds_name}...\n")
+
+                # Check latest API observation
+                url = f"/Datastreams({ds_id})/Observations?$orderby=phenomenonTime desc&$top=1"
+                api_obs = get_api_data(url)["value"]
+                if not api_obs:
+                    print(f"Datastream {ds_id} → No Observations in API.")
+                    conn.close()
+                    continue
+
+                latest_api_time = api_obs[0]["phenomenonTime"]
+
+                # Check latest DB observation
+                c = conn.cursor()
+                c.execute("""SELECT MAX(phenomenon_time_start) FROM observations WHERE datastream_id = ?;""", (ds_id,))
+                result = c.fetchone()
+                latest_db_time = result[0]
+
+                print(f"Datastream {ds_id} → API: {latest_api_time} | DB: {latest_db_time}")
+
+                # Compare
+                if latest_db_time is None:
+                    print(f"Datastream {ds_id} is missing in DB → Not up to date.")
+                elif latest_db_time < latest_api_time:
+                    print(f"Datastream {ds_id} has newer data in API → Not up to date.")
+                else:
+                    print(f"Datastream {ds_id} is up to date.")
             else:
-                print(f"Thing {thing_id} → {thing_name} has new data in API.")
+                print("Invalid choice.")
+
+            conn.close()
             continue
         elif choice == "d":
             delete_choice = input("Enter number of Location / Thing to delete: ").strip()
@@ -830,6 +946,18 @@ if __name__ == "__main__":
             continue
         elif choice == "l":
             display_numbered_list(numbered_list)
+            continue
+        elif choice == "r":
+            range_choice = input("Enter number of Location / Thing to show observation ranges: ").strip()
+            if not range_choice.isdigit() or not (1 <= int(range_choice) <= len(numbered_list)):
+                print("Invalid choice.")
+                continue
+
+            index = int(range_choice) - 1
+            thing_id, thing_name, loc_name = numbered_list[index]
+
+            print(f"\nShowing observation ranges for Thing {thing_id} → {thing_name} → {loc_name}\n")
+            show_thing_observation_ranges(thing_id)
             continue
         # Otherwise, assume populate
         if not choice.isdigit() or not (1 <= int(choice) <= len(numbered_list)):
