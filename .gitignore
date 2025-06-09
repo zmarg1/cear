@@ -1,4 +1,3 @@
 venv
 raw_data/*
-*.db
-*.db*
+*.db-journal
