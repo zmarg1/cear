@@ -9,7 +9,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dateutil.parser import isoparse  # safe ISO parser
 
-
 DB_PATH = "cear.db"
 BASE_URL = "https://api.sealevelsensors.org/v1.0"
 OBSERVATION_LIMIT = 10000
@@ -748,7 +747,7 @@ def populate_single_thing(thing_id: int):
             obs_limit_input = input("What is the maximum number of observations you want to collect? (Enter for ALL): ").strip()
             obs_limit = int(obs_limit_input) if obs_limit_input.isdigit() else None
 
-            print(f"→ Will fetch up to {obs_limit if obs_limit else 'ALL'} observations starting from {start_time or 'oldest'} toward present.\n")
+            print(f"→ Will fetch up to {obs_limit if obs_limit else 'ALL'} observations\n")
 
             # Now proceed — Fetch full Datastream (required for DB insert)
             ds_full = fetch_datastream_full(ds_id)
@@ -916,8 +915,9 @@ def fetch_new_observations(datastream_id: int, conn, page_size=1000, limit=None,
 
     except requests.exceptions.HTTPError as e:
         if e.response.status_code in [400, 500]:
-            print(f"⚠️ {e.response.status_code} Error on filtered query → falling back to fetch ALL observations and filter in Python.")
-            print(f"Datastream {datastream_id} → Fallback fetching observations...")
+            # Silently fallback — do not print warning for known 400/500 filter errors
+            #print(f"⚠️ {e.response.status_code} Error on filtered query → falling back to fetch ALL observations and filter in Python.")
+            #print(f"Datastream {datastream_id} → Fallback fetching observations...")
             # Fallback → fetch all with paging
             observations = fetch_all_observations(datastream_id, after_time=start_time, limit=limit)
 
