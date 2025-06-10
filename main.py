@@ -581,15 +581,78 @@ def get_datastream_time_range(datastream_id: int) -> tuple[str, str]:
 
 def populate_single_thing(thing_id: int):
     """Populate database for a single Thing (by thing_id)."""
+
+    print(f"\nPopulating Thing {thing_id} - {thing_id}")
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
+
+    # Fetch Datastreams
+    datastreams = fetch_datastreams(thing_id)
+
+    # Build list of (ds_id, ds_name, outstanding_obs)
+    ds_info_list = []
+
+    print("\nChecking outstanding observations for Datastreams...")
+
+    for ds in tqdm(datastreams, desc=f"Thing {thing_id} Datastreams", leave=False):
+        ds_id = ds["@iot.id"]
+        ds_name = ds.get("name", f"Datastream {ds_id}")
+
+        # Get total API obs count
+        count_url = f"/Datastreams({ds_id})/Observations?$top=0&$count=true"
+        try:
+            count_response = get_api_data(count_url)
+            total_api_count = count_response.get("@iot.count", "?")
+        except Exception as e:
+            print(f"⚠️ Could not fetch observation count for Datastream {ds_id}: {e}")
+            total_api_count = "?"
+
+        # Get total DB obs count
+        c.execute("""SELECT COUNT(*) FROM observations WHERE datastream_id = ?;""", (ds_id,))
+        existing_obs_count = c.fetchone()[0]
+
+        # Compute outstanding observations
+        if isinstance(total_api_count, int):
+            outstanding_obs = total_api_count - existing_obs_count
+            outstanding_obs = max(outstanding_obs, 0)
+        else:
+            outstanding_obs = "?"
+
+        ds_info_list.append((ds_id, ds_name, outstanding_obs))
+
+    conn.close()
+
+    # Print menu
+    print(f"\nThing {thing_id} → Populating available Datastreams:\n")
+
+    print("Available Datastreams:")
+    for i, (ds_id, ds_name, outstanding_obs) in enumerate(ds_info_list, start=1):
+        obs_str = f"{outstanding_obs}" if isinstance(outstanding_obs, int) else "(unknown)"
+        print(f"{i:2}. {ds_name} → {obs_str} outstanding observations")
+
+    # Ask which Datastream(s) to populate
+    ds_choice = input("\nEnter Datastream number to populate, 'A' to populate ALL, or 'Q' to cancel: ").strip().lower()
+
+    if ds_choice == "q":
+        print("Cancelled populate.")
+        return
+    elif ds_choice == "a":
+        ds_indexes = range(len(ds_info_list))
+    elif ds_choice.isdigit() and (1 <= int(ds_choice) <= len(ds_info_list)):
+        ds_indexes = [int(ds_choice) - 1]
+    else:
+        print("Invalid choice.")
+        return
+
+    # Now proceed to populate selected Datastream(s)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
     try:
         # Fetch the Thing
         url = f"/Things({thing_id})"
         thing = get_api_data(url)
-
-        print(f"\nPopulating Thing {thing_id} - {thing['name']}")
 
         c.execute("""INSERT OR IGNORE INTO things 
                     (thing_id, name, description, properties)
@@ -632,10 +695,11 @@ def populate_single_thing(thing_id: int):
                             VALUES (?, ?)""",
                         (hl_id, location_id))
 
-        # Datastreams
-        datastreams = fetch_datastreams(thing_id)
-        for ds in tqdm(datastreams, desc=f"Thing {thing_id} Datastreams"):
-            ds_id = ds["@iot.id"]
+        # Now process selected Datastream(s)
+        for ds_index in ds_indexes:
+            ds_id, ds_name, _ = ds_info_list[ds_index]
+
+            print(f"\n--- Processing Datastream {ds_id} ---")
 
             # Get metadata
             meta = get_datastream_metadata(ds_id)
@@ -645,28 +709,22 @@ def populate_single_thing(thing_id: int):
             existing_obs_count = c.fetchone()[0]
 
             # Print clean summary
-            print(f"\n--- Processing Datastream {ds_id} ---")
             print(f"Name: {meta['datastream_name']}")
             print(f"Observed Property: {meta['observed_property_name']}")
             print(f"Sensor: {meta['sensor_name']}")
             print(f"Total Observations in API: {meta['observation_count']}")
             print(f"Total Observations already in DB: {existing_obs_count}")
+
             # Show observation time range
             oldest_api_time, newest_api_time = get_datastream_time_range(ds_id)
             print(f"Oldest observation in API    : {oldest_api_time or '(no observations)'}")
             print(f"Most recent observation in API: {newest_api_time or '(no observations)'}")
 
-            # Also show "new observations" like in U/C
+            # Show DB time range + outstanding obs from full check
             range_info = get_datastream_check(ds_id, conn)
 
             print(f"Oldest observation in DB     : {range_info['oldest_db_time']}")
             print(f"Most recent observation in DB : {range_info['newest_db_time']}")
-
-            new_obs = range_info["new_obs_count"]
-            if new_obs >= 0:
-                print(f"New observations available   : {new_obs}")
-            else:
-                print(f"New observations available   : (unknown)")
 
             # Ask user whether to fetch this Datastream
             while True:
@@ -702,7 +760,6 @@ def populate_single_thing(thing_id: int):
 
             # Print latest time AFTER fetch — this is perfectly fine
             safe_print(f"Latest Observation in DB after fetch: {latest_db_time}")
-
 
             # Sensor
             sensor = fetch_sensor_from_link(sensor_link)
