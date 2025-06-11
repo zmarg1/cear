@@ -421,7 +421,7 @@ def create_db():
     c.executescript(schema_sql)
     conn.commit()
     conn.close()
-    print("Database schema created successfully.")
+    #print("Database schema created successfully.")
 
 # ---- Fetch functions ----
 
@@ -469,6 +469,110 @@ def fetch_feature_of_interest(observation_id: int) -> dict:
     return get_api_data(path)
 
 # ---- Main populate_db() ----
+def fetch_new_observations(datastream_id: int, conn, page_size=1000, limit=None, start_time=None) -> tuple[list, str]:
+    """
+    Fetch only new Observations for a Datastream:
+    - Check the DB for latest phenomenon_time_start
+    - Use $filter to fetch only newer observations
+    - Return (observations, latest_db_time)
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT MAX(phenomenon_time_start) 
+        FROM observations 
+        WHERE datastream_id = ?;
+    """, (datastream_id,))
+    result = c.fetchone()
+    latest_time = result[0]
+
+    if latest_time and "." in latest_time:
+        latest_time = latest_time.split(".")[0] + "Z"
+
+    if latest_time:
+        safe_print(f"Datastream {datastream_id} → Latest DB time: {latest_time}")
+    else:
+        safe_print(f"Datastream {datastream_id} → No existing DB observations → fetching all.")
+
+    observations = []
+    skip = 0
+    fetched = 0
+
+    try:
+        # --- NEW FAST FETCH LOGIC ---
+        fast_mode = limit is not None and limit <= 10 * page_size
+        switched_to_fallback = False
+
+        if fast_mode:
+            total_pages = (limit + page_size - 1) // page_size  # ceil division
+            #safe_print(f"→ Using FAST MODE (limit {limit}, page_size {page_size}, total_pages {total_pages})")
+
+            for page_num in range(total_pages):
+                params = {
+                    "$top": page_size,
+                    "$skip": skip,
+                    "$orderby": "phenomenonTime desc"
+                }
+
+                if start_time:
+                    start_time_for_filter = start_time[:-1] if start_time.endswith("Z") else start_time
+                    params["$filter"] = f"phenomenonTime ge datetime'{start_time_for_filter}'"
+                elif latest_time:
+                    latest_time_for_filter = latest_time[:-1] if latest_time.endswith("Z") else latest_time
+                    params["$filter"] = f"phenomenonTime gt datetime'{latest_time_for_filter}'"
+
+                url = f"{BASE_URL}/Datastreams({datastream_id})/Observations"
+
+                response = requests.get(url, params=params)
+                response.raise_for_status()
+                page = response.json()["value"]
+                #safe_print(f"Fetched page {page_num+1}/{total_pages} with {len(page)} observations (skip={skip})")
+
+                # Check if API is enforcing a smaller page size
+                if page_num == 0 and len(page) < page_size:
+                    #safe_print(f"⚠️ API returned only {len(page)} obs (requested {page_size}) — switching to fallback mode.")
+                    switched_to_fallback = True
+                    break  # exit fast_mode loop → fallback will take over
+
+                if not page:
+                    break
+
+                observations.extend(page)
+                fetched += len(page)
+                skip += len(page)
+
+                if fetched >= limit:
+                    return observations[:limit], latest_time
+
+            # If fallback was triggered
+            if switched_to_fallback:
+                observations = fetch_all_observations(datastream_id, after_time=start_time, limit=limit)
+                return observations, latest_time
+
+            return observations[:limit], latest_time
+        # --- END FAST FETCH LOGIC ---
+
+        # Fallback to full loop (normal case)
+        observations = fetch_all_observations(datastream_id, after_time=start_time, limit=limit)
+        return observations, latest_time
+
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code in [400, 500]:
+            # Silently fallback
+            #safe_print(f"HTTP {e.response.status_code} → fallback to full paging.")
+            observations = fetch_all_observations(datastream_id, after_time=start_time, limit=limit)
+
+            if latest_time:
+                filtered_observations = []
+                for obs in observations:
+                    obs_time = obs["phenomenonTime"]
+                    if obs_time > latest_time:
+                        filtered_observations.append(obs)
+                observations = filtered_observations
+        else:
+            raise  # Re-raise other errors
+
+    return observations, latest_time
+
 
 def fetch_all_observations(datastream_id: int, page_size=1000, after_time=None, limit=None) -> list:
     """
@@ -495,6 +599,10 @@ def fetch_all_observations(datastream_id: int, page_size=1000, after_time=None, 
             response = requests.get(url, params=params)
             response.raise_for_status()
             page = response.json()["value"]
+            #safe_print(f"Fetched page with {len(page)} observations (skip={skip})")
+            #if len(page) < page_size:
+                #safe_print(f"⚠️ API returned only {len(page)} obs (requested {page_size}) — server-side page size limit likely in effect.")
+
         except Exception as e:
             print(f"⚠️ Error during fallback paging for Datastream {datastream_id}: {e}")
             break
@@ -518,7 +626,7 @@ def fetch_all_observations(datastream_id: int, page_size=1000, after_time=None, 
                 pbar.close()
                 return observations
 
-        skip += page_size
+        skip += len(page)
         pbar.update(len(page))
 
     pbar.close()
@@ -532,16 +640,14 @@ def parse_time_range(field):
         return start, end
     return None, None
 
-def list_things() -> list:
-    """
-    List Things with associated Location name.
-    Return a list of tuples: [(thing_id, thing_name, location_name), ...]
-    """
+def list_things(show_output=True) -> list:
     things = get_api_data("/Things?$expand=Locations")["value"]
 
     numbered_list = []
 
-    print("\nAvailable Things by Location:")
+    if show_output:
+        print("\nAvailable Things by Location:")
+
     for thing in things:
         thing_id = thing["@iot.id"]
         thing_name = thing["name"]
@@ -550,14 +656,15 @@ def list_things() -> list:
             for loc in locations:
                 loc_name = loc["name"]
                 numbered_list.append((thing_id, thing_name, loc_name))
+                if show_output:
+                    print(f"{len(numbered_list):2}. {thing_name} → {loc_name}")
         else:
             numbered_list.append((thing_id, thing_name, "(No Location)"))
-
-    # Display numbered menu
-    for i, (thing_id, thing_name, loc_name) in enumerate(numbered_list, start=1):
-        print(f"{i:2}. {thing_name} → {loc_name}")
+            if show_output:
+                print(f"{len(numbered_list):2}. {thing_name} → (No Location)")
 
     return numbered_list
+
 
 def get_datastream_time_range(datastream_id: int) -> tuple[str, str]:
     """Return (oldest_observation_time, newest_observation_time) for a Datastream."""
@@ -758,7 +865,7 @@ def populate_single_thing(thing_id: int):
             observations, latest_db_time = fetch_new_observations(ds_id, conn, limit=obs_limit, start_time=start_time)
 
             # Print latest time AFTER fetch — this is perfectly fine
-            safe_print(f"Latest Observation in DB after fetch: {latest_db_time}")
+            #safe_print(f"Latest Observation in DB after fetch: {latest_db_time}")
 
             # Sensor
             sensor = fetch_sensor_from_link(sensor_link)
@@ -850,92 +957,6 @@ def is_thing_up_to_date(thing_id: int, conn, page_size=1) -> bool:
     return True
 
 
-def fetch_new_observations(datastream_id: int, conn, page_size=1000, limit=None, start_time=None) -> tuple[list, str]:
-    """
-    Fetch only new Observations for a Datastream:
-    - Check the DB for latest phenomenon_time_start
-    - Use $filter to fetch only newer observations
-    - Return (observations, latest_db_time)
-    """
-    c = conn.cursor()
-    c.execute("""
-        SELECT MAX(phenomenon_time_start) 
-        FROM observations 
-        WHERE datastream_id = ?;
-    """, (datastream_id,))
-    result = c.fetchone()
-    latest_time = result[0]
-
-    # Truncate microseconds if needed
-    if latest_time and "." in latest_time:
-        latest_time = latest_time.split(".")[0] + "Z"
-
-    # Always print this once
-    if latest_time:
-        safe_print(f"Datastream {datastream_id} → Latest DB time: {latest_time}")
-    else:
-        safe_print(f"Datastream {datastream_id} → No existing DB observations → fetching all.")
-
-    # Setup paging
-    observations = []
-    skip = 0
-    fetched = 0
-
-    try:
-        while True:
-            params = {
-                "$top": page_size,
-                "$skip": skip,
-                "$orderby": "phenomenonTime desc"
-            }
-
-            if start_time:
-                # If populate() passes a start_time (older than DB time), use it
-                start_time_for_filter = start_time[:-1] if start_time.endswith("Z") else start_time
-                params["$filter"] = f"phenomenonTime ge datetime'{start_time_for_filter}'"
-            elif latest_time:
-                latest_time_for_filter = latest_time[:-1] if latest_time.endswith("Z") else latest_time
-                params["$filter"] = f"phenomenonTime gt datetime'{latest_time_for_filter}'"
-
-            url = f"{BASE_URL}/Datastreams({datastream_id})/Observations"
-
-            response = requests.get(url, params=params)
-            response.raise_for_status()
-            page = response.json()["value"]
-
-            if not page:
-                break
-
-            observations.extend(page)
-            fetched += len(page)
-            skip += page_size
-
-            if limit and fetched >= limit:
-                return observations[:limit], latest_time
-
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code in [400, 500]:
-            # Silently fallback — do not print warning for known 400/500 filter errors
-            #print(f"⚠️ {e.response.status_code} Error on filtered query → falling back to fetch ALL observations and filter in Python.")
-            #print(f"Datastream {datastream_id} → Fallback fetching observations...")
-            # Fallback → fetch all with paging
-            observations = fetch_all_observations(datastream_id, after_time=start_time, limit=limit)
-
-            # Manual filtering if needed
-            if latest_time:
-                filtered_observations = []
-                for obs in observations:
-                    obs_time = obs["phenomenonTime"]
-                    if obs_time > latest_time:
-                        filtered_observations.append(obs)
-                observations = filtered_observations
-                print(f"Fallback fetched {len(observations)} new observations after filtering.")
-            else:
-                print(f"Fallback fetched {len(observations)} new observations.")
-        else:
-            raise  # Re-raise other errors
-
-    return observations, latest_time
 
 def view_db():
     conn = sqlite3.connect(DB_PATH)
@@ -1094,17 +1115,18 @@ def update_datastreams(thing_id: int):
 
 if __name__ == "__main__":
     create_db()
+    print("Welcome to the CEAR Hub Database CLI")
 
-    numbered_list = list_things()
+    numbered_list = list_things(show_output=False)
 
     while True:
         print("\nOptions:")
         print("  V        → View Database Contents")
-        print("  C        → Check Datastream-Observations Details")
-        print("  U        → Update Datastream Observations")
+        print("  L        → List Available Things in API")
+        print("  P        → Add Thing to the DB")
+        print("  U        → Update DB Datastream")
+        print("  C        → Check Datastream Details")
         print("  D        → Delete Thing from DB")
-        print("  L        → List Things")
-        print("  P        → Populate Thing")
         print("  Q        → Quit")
 
         choice = input("\nEnter choice: ").strip().lower()
@@ -1215,7 +1237,7 @@ if __name__ == "__main__":
                 print("Cancelled.")
             continue
         elif choice == "l":
-            display_numbered_list(numbered_list)
+            numbered_list = list_things(show_output=True)
             continue
         elif choice == "p":
             # Ask which Thing to populate
