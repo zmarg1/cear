@@ -1098,7 +1098,7 @@ def update_datastreams(thing_id: int):
             continue
 
         # --- Fetch and insert new observations ---
-        limit = range_info["new_obs_count"] if range_info["new_obs_count"] > 0 else 1000
+        limit = range_info["new_obs_count"] if range_info["new_obs_count"] > 0 else BATCH_SIZE
         observations, latest_db_time_after = fetch_new_observations(ds_id, conn, limit=limit)
 
         print(f"Latest Observation in DB before update: {range_info['newest_db_time']}")
