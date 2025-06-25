@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import requests
 import json
@@ -8,8 +9,12 @@ import sys
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dateutil.parser import isoparse  # safe ISO parser
+import psycopg2
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 
-DB_PATH = "cear.db"
+
+#DB_PATH = "cear.db"
 BASE_URL = "https://api.sealevelsensors.org/v1.0"
 OBSERVATION_LIMIT = 10000
 BATCH_SIZE = 1000
@@ -29,7 +34,19 @@ adapter = HTTPAdapter(max_retries=retries)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
-# ---- Helpers ----
+def get_db_url():
+    load_dotenv()
+    db_url = os.getenv("SUPABASE_DB_URL")
+    if not db_url:
+        raise ValueError("SUPABASE_DB_URL not set in .env file or environment.")
+    return db_url
+
+def get_connection():
+    return psycopg2.connect(get_db_url())
+
+def get_engine():
+    return create_engine(get_db_url())
+
 def clean_iso_datetime(ts):
     # Example input → '2025-06-09T18:22:37.983312' OR '2025-06-09TT18:22:37.983312'
     ts = ts.replace("TT", "T")  # fix any accidental double T
@@ -117,7 +134,7 @@ def get_datastream_check(datastream_id: int, conn) -> dict:
     c.execute("""
         SELECT MIN(phenomenon_time_start), MAX(phenomenon_time_start)
         FROM observations
-        WHERE datastream_id = ?;
+        WHERE datastream_id = %s;
     """, (datastream_id,))
     result = c.fetchone()
     oldest_db_time, newest_db_time = result if result else (None, None)
@@ -161,26 +178,35 @@ def get_datastream_check(datastream_id: int, conn) -> dict:
             new_obs_count = 0
         else:
             try:
-                print(f"DEBUG: db_time_iso for count query = {clean_db_time}")
+                print(f"DEBUG: db_time_iso for fallback comparison = {clean_db_time}")
 
+                # Get most recent observation (no $filter)
+                url = f"{BASE_URL}/Datastreams({datastream_id})/Observations"
                 params = {
-                    "$top": 0,
-                    "$count": "true",
-                    "$filter": f"phenomenonTime gt datetime'{clean_db_time}'"
+                    "$top": 1,
+                    "$orderby": "phenomenonTime desc"
                 }
 
-                url = f"{BASE_URL}/Datastreams({datastream_id})/Observations"
+                full_url = requests.Request('GET', url, params=params).prepare().url
+                print(f"DEBUG: Fallback request URL (no filter) = {full_url}")
+
                 response = requests.get(url, params=params)
                 response.raise_for_status()
-                count_response = response.json()
+                result = response.json()
+                api_latest_obs = result.get("value", [{}])[0].get("phenomenonTime", "")
 
-                new_obs_count = count_response.get("@iot.count", -1)
-                up_to_date = (new_obs_count == 0)
+                print(f"DEBUG: Latest phenomenonTime from API = {api_latest_obs}")
+
+                # Compare timestamps directly
+                up_to_date = (api_latest_obs <= clean_db_time)
+                new_obs_count = 1 if not up_to_date else 0
 
             except Exception as e:
                 print(f"⚠️ Could not check new observations for Datastream {datastream_id}: {e}")
                 up_to_date = False
                 new_obs_count = -1
+
+    c.close()
 
     # Final return dict
     return {
@@ -265,9 +291,10 @@ def insert_observations(conn, c, datastream_id, observations, batch_size):
 
         # FeatureOfInterest
         foi = fetch_feature_of_interest(obs_id)
-        c.execute("""INSERT OR IGNORE INTO features_of_interest 
+        c.execute("""INSERT INTO features_of_interest 
                      (feature_of_interest_id, name, description, encoding_type, feature, properties)
-                     VALUES (?, ?, ?, ?, ?, ?)""",
+                     VALUES (%s, %s, %s, %s, %s, %s)
+                     ON CONFLICT (feature_of_interest_id) DO NOTHING""",
                   (foi["@iot.id"], foi["name"], foi.get("description", ""), foi["encodingType"],
                    json.dumps(foi["feature"]), json.dumps(foi.get("properties", {}))))
 
@@ -277,10 +304,11 @@ def insert_observations(conn, c, datastream_id, observations, batch_size):
         phenomenon_end = clean_iso_datetime(phenomenon_end) if phenomenon_end else None
         valid_start, valid_end = parse_interval(obs.get("validTime"))
 
-        c.execute("""INSERT OR IGNORE INTO observations 
+        c.execute("""INSERT INTO observations 
             (observation_id, datastream_id, phenomenon_time_start, phenomenon_time_end,
             result_time, result, result_quality, valid_time_start, valid_time_end, parameters, feature_of_interest_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (observation_id) DO NOTHING""",
             (obs_id, datastream_id,
             phenomenon_start,
             phenomenon_end,
@@ -416,10 +444,16 @@ def create_db():
     );
     """
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     c = conn.cursor()
-    c.executescript(schema_sql)
+    
+    # Split SQL script into individual statements and execute one by one
+    for statement in schema_sql.strip().split(';'):
+        if statement.strip():
+            c.execute(statement + ';')
+    
     conn.commit()
+    c.close()
     conn.close()
     #print("Database schema created successfully.")
 
@@ -480,7 +514,7 @@ def fetch_new_observations(datastream_id: int, conn, page_size=1000, limit=None,
     c.execute("""
         SELECT MAX(phenomenon_time_start) 
         FROM observations 
-        WHERE datastream_id = ?;
+        WHERE datastream_id = %s;
     """, (datastream_id,))
     result = c.fetchone()
     latest_time = result[0]
@@ -545,32 +579,35 @@ def fetch_new_observations(datastream_id: int, conn, page_size=1000, limit=None,
 
             # If fallback was triggered
             if switched_to_fallback:
-                observations = fetch_all_observations(datastream_id, after_time=start_time, limit=limit)
+                observations = fetch_all_observations(
+                    datastream_id,
+                    after_time=latest_time or start_time,
+                    limit=limit
+                )
                 return observations, latest_time
 
             return observations[:limit], latest_time
         # --- END FAST FETCH LOGIC ---
 
         # Fallback to full loop (normal case)
-        observations = fetch_all_observations(datastream_id, after_time=start_time, limit=limit)
+        observations = fetch_all_observations(
+            datastream_id,
+            after_time=latest_time or start_time,
+            limit=limit
+        )
         return observations, latest_time
 
     except requests.exceptions.HTTPError as e:
         if e.response.status_code in [400, 500]:
-            # Silently fallback
-            #safe_print(f"HTTP {e.response.status_code} → fallback to full paging.")
-            observations = fetch_all_observations(datastream_id, after_time=start_time, limit=limit)
-
-            if latest_time:
-                filtered_observations = []
-                for obs in observations:
-                    obs_time = obs["phenomenonTime"]
-                    if obs_time > latest_time:
-                        filtered_observations.append(obs)
-                observations = filtered_observations
+            # fallback again using correct after_time
+            observations = fetch_all_observations(
+                datastream_id,
+                after_time=latest_time or start_time,
+                limit=limit
+            )
         else:
             raise  # Re-raise other errors
-
+        
     return observations, latest_time
 
 
@@ -690,7 +727,7 @@ def populate_single_thing(thing_id: int):
 
     print(f"\nPopulating Thing {thing_id} - {thing_id}")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     c = conn.cursor()
 
     # Fetch Datastreams
@@ -715,7 +752,7 @@ def populate_single_thing(thing_id: int):
             total_api_count = "?"
 
         # Get total DB obs count
-        c.execute("""SELECT COUNT(*) FROM observations WHERE datastream_id = ?;""", (ds_id,))
+        c.execute("""SELECT COUNT(*) FROM observations WHERE datastream_id = %s;""", (ds_id,))
         existing_obs_count = c.fetchone()[0]
 
         # Compute outstanding observations
@@ -727,6 +764,7 @@ def populate_single_thing(thing_id: int):
 
         ds_info_list.append((ds_id, ds_name, outstanding_obs))
 
+    c.close()
     conn.close()
 
     # Print menu
@@ -752,7 +790,7 @@ def populate_single_thing(thing_id: int):
         return
 
     # Now proceed to populate selected Datastream(s)
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     c = conn.cursor()
 
     try:
@@ -760,9 +798,10 @@ def populate_single_thing(thing_id: int):
         url = f"/Things({thing_id})"
         thing = get_api_data(url)
 
-        c.execute("""INSERT OR IGNORE INTO things 
+        c.execute("""INSERT INTO things 
                     (thing_id, name, description, properties)
-                    VALUES (?, ?, ?, ?)""",
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (thing_id) DO NOTHING""",
                 (thing_id, thing["name"], thing.get("description", ""), 
                 json.dumps(thing.get("properties", {}))))
 
@@ -770,35 +809,40 @@ def populate_single_thing(thing_id: int):
         locations = fetch_locations(thing_id)
         for loc in tqdm(locations, desc=f"Thing {thing_id} Locations"):
             location_id = loc["@iot.id"]
-            c.execute("""INSERT OR IGNORE INTO locations 
+            c.execute("""INSERT INTO locations 
                         (location_id, name, description, encoding_type, location, properties)
-                        VALUES (?, ?, ?, ?, ?, ?)""",
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (location_id) DO NOTHING""",
                     (location_id, loc["name"], loc.get("description", ""), loc["encodingType"],
                     json.dumps(loc["location"]), json.dumps(loc.get("properties", {}))))
-            c.execute("""INSERT OR IGNORE INTO thing_locations 
+            c.execute("""INSERT INTO thing_locations 
                         (thing_id, location_id)
-                        VALUES (?, ?)""",
+                        VALUES (%s, %s)
+                        ON CONFLICT (thing_id) DO NOTHING""",
                     (thing_id, location_id))
 
         # HistoricalLocations
         historical_locations = fetch_historical_locations(thing_id)
         for hl in tqdm(historical_locations, desc=f"Thing {thing_id} HistoricalLocations"):
             hl_id = hl["@iot.id"]
-            c.execute("""INSERT OR IGNORE INTO historical_locations 
+            c.execute("""INSERT INTO historical_locations 
                         (historical_location_id, thing_id, time)
-                        VALUES (?, ?, ?)""",
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (historical_location_id) DO NOTHING""",
                     (hl_id, thing_id, hl["time"]))
 
             for loc in hl.get("Locations", []):
                 location_id = loc["@iot.id"]
-                c.execute("""INSERT OR IGNORE INTO locations 
+                c.execute("""INSERT INTO locations 
                             (location_id, name, description, encoding_type, location, properties)
-                            VALUES (?, ?, ?, ?, ?, ?)""",
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (location_id) DO NOTHING""",
                         (location_id, loc["name"], loc.get("description", ""), loc["encodingType"],
                         json.dumps(loc["location"]), json.dumps(loc.get("properties", {}))))
-                c.execute("""INSERT OR IGNORE INTO historical_location_locations 
+                c.execute("""INSERT INTO historical_location_locations 
                             (historical_location_id, location_id)
-                            VALUES (?, ?)""",
+                            VALUES (%s, %s)
+                            ON CONFLICT (historical_location_id) DO NOTHING""",
                         (hl_id, location_id))
 
         # Now process selected Datastream(s)
@@ -811,7 +855,7 @@ def populate_single_thing(thing_id: int):
             meta = get_datastream_metadata(ds_id)
 
             # Count existing observations in DB
-            c.execute("""SELECT COUNT(*) FROM observations WHERE datastream_id = ?;""", (ds_id,))
+            c.execute("""SELECT COUNT(*) FROM observations WHERE datastream_id = %s;""", (ds_id,))
             existing_obs_count = c.fetchone()[0]
 
             # Print clean summary
@@ -869,17 +913,19 @@ def populate_single_thing(thing_id: int):
 
             # Sensor
             sensor = fetch_sensor_from_link(sensor_link)
-            c.execute("""INSERT OR IGNORE INTO sensors 
+            c.execute("""INSERT INTO sensors 
                         (sensor_id, name, description, encoding_type, metadata, properties)
-                        VALUES (?, ?, ?, ?, ?, ?)""",
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (sensor_id) DO NOTHING""",
                     (sensor["@iot.id"], sensor["name"], sensor.get("description", ""),
                     sensor["encodingType"], sensor.get("metadata", ""), json.dumps(sensor.get("properties", {}))))
 
             # ObservedProperty
             op = fetch_observed_property_from_link(op_link)
-            c.execute("""INSERT OR IGNORE INTO observed_properties 
+            c.execute("""INSERT INTO observed_properties 
                         (observed_property_id, name, description, definition, properties)
-                        VALUES (?, ?, ?, ?, ?)""",
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (observed_property_id) DO NOTHING""",
                     (op["@iot.id"], op["name"], op.get("description", ""), op["definition"], 
                     json.dumps(op.get("properties", {}))))
 
@@ -888,11 +934,12 @@ def populate_single_thing(thing_id: int):
             pheno_start, pheno_end = parse_time_range(ds_full.get("phenomenonTime", ""))
             result_start, result_end = parse_time_range(ds_full.get("resultTime", ""))
 
-            c.execute("""INSERT OR IGNORE INTO datastreams 
+            c.execute("""INSERT INTO datastreams 
                         (datastream_id, thing_id, sensor_id, observed_property_id, name, description, observation_type,
                         unit_of_measurement_name, unit_of_measurement_symbol, unit_of_measurement_definition,
                         observed_area, phenomenon_time_start, phenomenon_time_end, result_time_start, result_time_end, properties)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (datastream_id) DO NOTHING""",
                     (ds_id, thing_id, sensor["@iot.id"], op["@iot.id"], ds_full["name"], ds_full.get("description", ""),
                     ds_full["observationType"], uom.get("name", ""), uom.get("symbol", ""), uom.get("definition", ""),
                     json.dumps(ds_full.get("observedArea", None)),
@@ -910,6 +957,7 @@ def populate_single_thing(thing_id: int):
 
     finally:
         # Always close connection
+        c.close()
         conn.close()
         print(f"\nFinished populating Thing {thing_id}.\n")
 
@@ -937,7 +985,7 @@ def is_thing_up_to_date(thing_id: int, conn, page_size=1) -> bool:
         c.execute("""
             SELECT MAX(phenomenon_time_start)
             FROM observations
-            WHERE datastream_id = ?;
+            WHERE datastream_id = %s;
         """, (ds_id,))
         result = c.fetchone()
         latest_db_time = result[0]
@@ -959,17 +1007,23 @@ def is_thing_up_to_date(thing_id: int, conn, page_size=1) -> bool:
 
 
 def view_db():
-    conn = sqlite3.connect(DB_PATH)
+    engine = get_engine()
+    conn = engine.raw_connection()
+    cur = conn.cursor()
 
-    tables = [
-        "things", "locations", "thing_locations", "historical_locations", "historical_location_locations",
-        "sensors", "observed_properties", "datastreams", "features_of_interest", "observations"
-    ]
+    cur.execute("""
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public'
+        ORDER BY table_name;
+    """)
+    tables = cur.fetchall()  # List of tuples like [('things',), ('locations',)]
 
     while True:
         print("\n--- Available Tables ---")
-        for i, table in enumerate(tables, start=1):
-            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for i, (table,) in enumerate(tables, start=1):
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            count = cur.fetchone()[0]
             print(f"{i:2}. {table} ({count} rows)")
         print(" Q. Return to main menu")
 
@@ -982,18 +1036,19 @@ def view_db():
             continue
 
         index = int(choice) - 1
-        table = tables[index]
+        table = tables[index][0]  # Extract table name from tuple
 
         print(f"\n--- Preview: {table} ---")
-        df = pd.read_sql_query(f"SELECT * FROM {table} LIMIT 10", conn)
+        df = pd.read_sql_query(f"SELECT * FROM {table} LIMIT 10", engine)
         print(df.to_string(index=False))
 
+    cur.close()
     conn.close()
 
 def delete_thing(thing_id: int):
     """Delete a Thing and all related data from the database."""
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     c = conn.cursor()
 
     print(f"\nDeleting Thing {thing_id} and all related data...")
@@ -1002,31 +1057,32 @@ def delete_thing(thing_id: int):
     c.execute("""
         DELETE FROM observations 
         WHERE datastream_id IN (
-            SELECT datastream_id FROM datastreams WHERE thing_id = ?
+            SELECT datastream_id FROM datastreams WHERE thing_id = %s
         )
     """, (thing_id,))
 
     # Delete Datastreams
-    c.execute("DELETE FROM datastreams WHERE thing_id = ?", (thing_id,))
+    c.execute("DELETE FROM datastreams WHERE thing_id = %s", (thing_id,))
 
     # Delete HistoricalLocation-Location links
     c.execute("""
         DELETE FROM historical_location_locations
         WHERE historical_location_id IN (
-            SELECT historical_location_id FROM historical_locations WHERE thing_id = ?
+            SELECT historical_location_id FROM historical_locations WHERE thing_id = %s
         )
     """, (thing_id,))
 
     # Delete HistoricalLocations
-    c.execute("DELETE FROM historical_locations WHERE thing_id = ?", (thing_id,))
+    c.execute("DELETE FROM historical_locations WHERE thing_id = %s", (thing_id,))
 
     # Delete Thing-Location links
-    c.execute("DELETE FROM thing_locations WHERE thing_id = ?", (thing_id,))
+    c.execute("DELETE FROM thing_locations WHERE thing_id = %s", (thing_id,))
 
     # Finally delete the Thing
-    c.execute("DELETE FROM things WHERE thing_id = ?", (thing_id,))
+    c.execute("DELETE FROM things WHERE thing_id = %s", (thing_id,))
 
     conn.commit()
+    c.close()
     conn.close()
 
     print(f"Thing {thing_id} deleted from database.\n")
@@ -1039,7 +1095,7 @@ def display_numbered_list(numbered_list):
 def update_datastreams(thing_id: int):
     """Update observations for a selected Thing and selected Datastream(s) (menu U)."""
     print(f"\nUpdating Observations for Thing {thing_id} → ", end="")
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     c = conn.cursor()
 
     # Get Thing name and Location for display
@@ -1062,6 +1118,7 @@ def update_datastreams(thing_id: int):
         ds_indexes = [int(ds_choice) - 1]  # single datastream
     else:
         print("Invalid choice.")
+        c.close()
         conn.close()
         return
 
@@ -1101,7 +1158,8 @@ def update_datastreams(thing_id: int):
             continue
 
         # --- Fetch and insert new observations ---
-        observations, latest_db_time_after = fetch_new_observations(ds_id, conn)
+        limit = range_info["new_obs_count"] if range_info["new_obs_count"] > 0 else 1000
+        observations, latest_db_time_after = fetch_new_observations(ds_id, conn, limit=limit)
 
         print(f"Latest Observation in DB before update: {range_info['newest_db_time']}")
         if not observations:
@@ -1111,6 +1169,7 @@ def update_datastreams(thing_id: int):
         insert_observations(conn, c, ds_id, observations, batch_size=BATCH_SIZE)
         print(f"Finished updating Datastream {ds_id}.\n")
 
+    c.close()
     conn.close()
 
 if __name__ == "__main__":
@@ -1153,7 +1212,7 @@ if __name__ == "__main__":
             print("\nEnter Datastream number to check, or 'A' to check ALL Datastreams.")
             ds_choice = input("Your choice: ").strip().lower()
 
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_connection()
 
             if ds_choice == "a":
                 print(f"\nChecking observation ranges and up-to-date status for Thing {thing_id} → {thing_name} → {loc_name}...\n")
