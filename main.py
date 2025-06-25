@@ -178,7 +178,7 @@ def get_datastream_check(datastream_id: int, conn) -> dict:
             new_obs_count = 0
         else:
             try:
-                print(f"DEBUG: db_time_iso for fallback comparison = {clean_db_time}")
+                #print(f"DEBUG: db_time_iso for fallback comparison = {clean_db_time}")
 
                 # Get most recent observation (no $filter)
                 url = f"{BASE_URL}/Datastreams({datastream_id})/Observations"
@@ -188,14 +188,14 @@ def get_datastream_check(datastream_id: int, conn) -> dict:
                 }
 
                 full_url = requests.Request('GET', url, params=params).prepare().url
-                print(f"DEBUG: Fallback request URL (no filter) = {full_url}")
+                #print(f"DEBUG: Fallback request URL (no filter) = {full_url}")
 
                 response = requests.get(url, params=params)
                 response.raise_for_status()
                 result = response.json()
                 api_latest_obs = result.get("value", [{}])[0].get("phenomenonTime", "")
 
-                print(f"DEBUG: Latest phenomenonTime from API = {api_latest_obs}")
+                #print(f"DEBUG: Latest phenomenonTime from API = {api_latest_obs}")
 
                 # Compare timestamps directly
                 up_to_date = (api_latest_obs <= clean_db_time)
@@ -1276,8 +1276,6 @@ if __name__ == "__main__":
 
             index = int(update_choice) - 1
             thing_id, thing_name, loc_name = numbered_list[index]
-
-            print(f"\nUpdating Observations for Thing {thing_id} → {thing_name} → {loc_name}\n")
             update_datastreams(thing_id)
             continue
         elif choice == "d":
