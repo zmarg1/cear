@@ -61,24 +61,16 @@ For example, you can type "V" in the terminal to preview the database contents.
 ```bash
     Enter choice: V
 
-    --- Available Tables ---
-    1. communities (1 rows)
-    2. datastreams (4 rows)
-    3. events (1 rows)
-    4. features_of_interest (4 rows)
-    5. historical_location_locations (6 rows)
-    6. historical_locations (6 rows)
-    7. locations (5 rows)
-    8. observations (4002 rows)
-    9. observed_properties (1 rows)
-    10. reports (2 rows)
-    11. sensors (1 rows)
-    12. sot_locations (1 rows)
-    13. sot_photo_metadata (0 rows)
-    14. sot_photos (0 rows)
-    15. thing_locations (4 rows)
-    16. things (4 rows)
-    17. users (4 rows)
+    --- Available Tables --- 
+    1. features_of_interest (4 rows)
+    2. historical_location_locations (6 rows)
+    3. historical_locations (6 rows)
+    4. locations (5 rows)
+    5. observations (4002 rows)
+    6. observed_properties (1 rows)
+    7. sensors (1 rows)
+    8. thing_locations (4 rows)
+    9. things (4 rows)
     Q. Return to main menu
 
     Enter table number to view, or 'Q' to return:
