@@ -1,32 +1,27 @@
 import os
-import sqlite3
-import requests
-import json
-from tqdm import tqdm
-import pandas as pd
-from datetime import datetime, timedelta
 import sys
+import json
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from dateutil.parser import isoparse  # safe ISO parser
+import pandas as pd
+from tqdm import tqdm
 import psycopg2
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 
-
-#DB_PATH = "cear.db"
+# Global Constants
 BASE_URL = "https://api.sealevelsensors.org/v1.0"
-OBSERVATION_LIMIT = 10000
 BATCH_SIZE = 1000
 
 # Global session with retries and backoff
 session = requests.Session()
 
 retries = Retry(
-    total=5,  # retry up to 5 times
-    backoff_factor=1,  # wait 1s, 2s, 4s, etc.
-    status_forcelist=[500, 502, 503, 504, 429],  # server or rate limit errors
-    allowed_methods=["HEAD", "GET", "OPTIONS"],  # safe to retry GET requests
+    total=5,
+    backoff_factor=1,
+    status_forcelist=[500, 502, 503, 504, 429],
+    allowed_methods=["HEAD", "GET", "OPTIONS"],
     raise_on_status=False
 )
 
@@ -56,27 +51,6 @@ def clean_iso_datetime(ts):
         ts += "Z"
     return ts
 
-def strip_microseconds_z(dt_str):
-    try:
-        dt = datetime.fromisoformat(dt_str.replace("Z", ""))
-        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    except Exception:
-        return dt_str
-
-def format_time_for_filter(dt: datetime) -> str:
-    """Format datetime for API filter — always safe."""
-    if dt.microsecond == 0:
-        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    else:
-        # Use milliseconds with exactly 3 digits
-        return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
-
-
-def truncate_to_millis(iso_string):
-    """Format ISO timestamp to API-compatible string: drop microseconds, add 'Z'"""
-    dt = datetime.fromisoformat(iso_string.replace("Z", ""))
-    return dt.replace(microsecond=0).isoformat() + "Z"
-
 def list_datastreams_for_thing(thing_id: int) -> list[tuple[int, str]]:
     """Return a numbered list of (datastream_id, datastream_name) for a Thing."""
     datastreams = fetch_datastreams(thing_id)
@@ -90,19 +64,6 @@ def list_datastreams_for_thing(thing_id: int) -> list[tuple[int, str]]:
         numbered_list.append((ds_id, ds_name))
 
     return numbered_list
-
-def normalize_start_time_input(user_input: str) -> str | None:
-    """Normalize user input for start time to full ISO format, or None if blank."""
-    user_input = user_input.strip()
-    if not user_input:
-        return None  # user pressed Enter → start from oldest
-
-    # If user enters YYYY-MM-DD → convert to full ISO
-    if len(user_input) == 10 and user_input.count("-") == 2:
-        return user_input + "T00:00:00Z"
-
-    # Otherwise assume they entered full ISO → use as is
-    return user_input
 
 def get_datastream_check(datastream_id: int, conn) -> dict:
     """
@@ -264,19 +225,6 @@ def parse_interval(val):
     else:
         return None, None
 
-def truncate_and_shift_time(iso_time_str):
-    """Shift a timestamp forward by 1 second to avoid ambiguity at sub-second resolution."""
-    if not iso_time_str:
-        return None
-    try:
-        dt = datetime.fromisoformat(iso_time_str.replace("Z", ""))
-        dt += timedelta(seconds=1)
-        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    except Exception as e:
-        print(f"⚠️ Failed to parse and shift time: {iso_time_str} → {e}")
-        return iso_time_str
-
-    
 def insert_observations(conn, c, datastream_id, observations, batch_size):
     count_since_commit = 0
 
@@ -333,11 +281,6 @@ def insert_observations(conn, c, datastream_id, observations, batch_size):
         conn.commit()
         print(f"Final commit of {count_since_commit} observations for Datastream {datastream_id}.")
 
-
-
-
-
-# Step 1: Create database and tables
 def create_db():
     schema_sql = """
     CREATE TABLE IF NOT EXISTS things (
@@ -458,7 +401,6 @@ def create_db():
     #print("Database schema created successfully.")
 
 # ---- Fetch functions ----
-
 def fetch_things() -> list:
     """Fetch all Things."""
     return get_api_data("/Things")["value"]
@@ -610,7 +552,6 @@ def fetch_new_observations(datastream_id: int, conn, page_size=1000, limit=None,
         
     return observations, latest_time
 
-
 def fetch_all_observations(datastream_id: int, page_size=1000, after_time=None, limit=None) -> list:
     """
     Fetch Observations for a Datastream using paging.
@@ -669,7 +610,6 @@ def fetch_all_observations(datastream_id: int, page_size=1000, after_time=None, 
     pbar.close()
     return observations
 
-
 def parse_time_range(field):
     """Parse start/end time range."""
     if isinstance(field, str) and "/" in field:
@@ -702,7 +642,6 @@ def list_things(show_output=True) -> list:
 
     return numbered_list
 
-
 def get_datastream_time_range(datastream_id: int) -> tuple[str, str]:
     """Return (oldest_observation_time, newest_observation_time) for a Datastream."""
     try:
@@ -720,7 +659,6 @@ def get_datastream_time_range(datastream_id: int) -> tuple[str, str]:
     except Exception as e:
         print(f"⚠️ Error fetching time range for Datastream {datastream_id}: {e}")
         return None, None
-
 
 def populate_single_thing(thing_id: int):
     """Populate database for a single Thing (by thing_id)."""
@@ -1005,7 +943,6 @@ def is_thing_up_to_date(thing_id: int, conn, page_size=1) -> bool:
     return True
 
 
-
 def view_db():
     engine = get_engine()
     conn = engine.raw_connection()
@@ -1044,6 +981,7 @@ def view_db():
 
     cur.close()
     conn.close()
+
 
 def delete_thing(thing_id: int):
     """Delete a Thing and all related data from the database."""
@@ -1087,10 +1025,12 @@ def delete_thing(thing_id: int):
 
     print(f"Thing {thing_id} deleted from database.\n")
 
+
 def display_numbered_list(numbered_list):
     print("\nAvailable Things by Location:")
     for i, (thing_id, thing_name, loc_name) in enumerate(numbered_list, start=1):
         print(f"{i:2}. {thing_name} → {loc_name}")
+
 
 def update_datastreams(thing_id: int):
     """Update observations for a selected Thing and selected Datastream(s) (menu U)."""
@@ -1171,6 +1111,7 @@ def update_datastreams(thing_id: int):
 
     c.close()
     conn.close()
+
 
 if __name__ == "__main__":
     create_db()
