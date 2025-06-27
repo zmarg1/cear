@@ -2,3 +2,4 @@ venv
 raw_data/*
 *.db-journal
 .env
+.vscode

@@ -1,28 +1,26 @@
-import { serve } from "https://deno.land/std/http/server.ts";
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // ── CONFIG ──────────────────────────────────────────────────────────
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const BASE_API     = "https://api.sealevelsensors.org/v1.0";
-const PAGE_SIZE    = 1_000;            // external API page size
-const CHUNK_SIZE   = 1_000;            // insert batch size (matches PAGE_SIZE)
+const SUPABASE_URL  = Deno.env.get("SUPABASE_URL")!;
+const SERVICE_ROLE  = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const BASE_API      = "https://api.sealevelsensors.org/v1.0";
+const PAGE_SIZE     = 1_000;
+const CHUNK_SIZE    = 1_000;
 // ─────────────────────────────────────────────────────────────────────
 
 const db = createClient(SUPABASE_URL, SERVICE_ROLE, {
   auth: { persistSession: false }
 });
 
-/* ───────────────── helpers ───────────────────────────────────────── */
+/* ───────── helpers ───────── */
 
-/** All datastream IDs already present in the `datastreams` table. */
 async function allDatastreamIds(): Promise<number[]> {
   const { data, error } = await db.from("datastreams").select("datastream_id");
   if (error) throw error;
   return (data ?? []).map(r => r.datastream_id as number);
 }
 
-/** Newest timestamp we already have for a datastream. */
 async function latestInDb(dsId: number) {
   const { data, error } = await db
     .from("observations")
@@ -35,10 +33,23 @@ async function latestInDb(dsId: number) {
   return data?.phenomenon_time_start as string | undefined;
 }
 
-/**
- * Yield *all* API observations newer than `afterTime`.
- * Uses $orderby desc + paging with $skip, never $filter.
- */
+/* ── NEW: fetch FeatureOfInterest once per observation ───────────── */
+async function fetchFOI(obsId: number) {
+  // 1) get Observation to obtain FOI link
+  const o = await (await fetch(`${BASE_API}/Observations(${obsId})`)).json();
+  const link: string = o["FeatureOfInterest@iot.navigationLink"];          // .../Observations(id)/FeatureOfInterest
+  // 2) fetch FOI details
+  const foi = await (await fetch(link)).json();
+  return {
+    feature_of_interest_id: foi["@iot.id"] as number,
+    name:                   foi.name as string,
+    description:            foi.description ?? "",
+    encoding_type:          foi.encodingType as string,
+    feature:                foi.feature,
+    properties:             foi.properties ?? {}
+  };
+}
+
 async function* streamNewObs(dsId: number, afterTime?: string) {
   let skip = 0;
   let keepGoing = true;
@@ -58,54 +69,70 @@ async function* streamNewObs(dsId: number, afterTime?: string) {
 
     for (const obs of page) {
       if (afterTime && obs.phenomenonTime <= afterTime) {
-        keepGoing = false;             // reached older data → stop
+        keepGoing = false;
         break;
       }
-      yield obs;                       // emit fresh row
+      yield obs;
     }
 
-    if (page.length < PAGE_SIZE) break; // last page
+    if (page.length < PAGE_SIZE) break;
     skip += PAGE_SIZE;
   }
 }
 
-/** Insert rows in chunks with conflict-ignore. */
+/* ── NEW: bulk insert FOIs first ─────────────────────────────────── */
+async function insertFOIs(rows: Awaited<ReturnType<typeof fetchFOI>>[]) {
+  if (!rows.length) return;
+  const { error } = await db
+    .from("features_of_interest")
+    .insert(rows, { onConflict: "feature_of_interest_id", ignoreDuplicates: true });
+  if (error && error.code !== "23505") throw error; // ignore existing rows
+}
+
+/* ── UPDATED: insert observation chunk ───────────────────────────── */
 async function insertChunk(dsId: number, chunk: any[]) {
-  const rows = chunk.map(o => ({
+  if (!chunk.length) return 0;
+
+  /* 1 ▸ fetch all FOIs in parallel */
+  const foiRows = await Promise.all(chunk.map((o) => fetchFOI(o["@iot.id"])));
+
+  /* 2 ▸ insert FOIs (idempotent) */
+  await insertFOIs(foiRows);
+
+  /* 3 ▸ prepare observation rows with valid fk */
+  const obsRows = chunk.map((o, idx) => ({
     observation_id:        o["@iot.id"],
     datastream_id:         dsId,
     phenomenon_time_start: o.phenomenonTime,
     result_time:           o.resultTime,
     result:                o.result,
-    parameters:            o.parameters
+    parameters:            o.parameters,
+    feature_of_interest_id: foiRows[idx].feature_of_interest_id
   }));
 
+  /* 4 ▸ insert observations */
   const { error, count } = await db
     .from("observations")
-    .insert(rows, {
+    .insert(obsRows, {
       onConflict: "observation_id",
       returning: "minimal",
       count: "exact"
     });
-  if (error) throw error;
+  if (error && error.code !== "23505") throw error;
   return count ?? 0;
 }
 
-/* ────────────────── Edge Function entry ─────────────────────────── */
+/* ── Edge Function entry stays unchanged ─────────────────────────── */
 serve(async () => {
   const report: Record<number, { fetched: number; inserted: number }> = {};
 
   for (const dsId of await allDatastreamIds()) {
     const latest = await latestInDb(dsId);
 
-    let fetched = 0;
-    let inserted = 0;
-    let buffer: any[] = [];
-
+    let fetched = 0, inserted = 0, buffer: any[] = [];
     for await (const obs of streamNewObs(dsId, latest)) {
       buffer.push(obs);
       fetched++;
-
       if (buffer.length === CHUNK_SIZE) {
         inserted += await insertChunk(dsId, buffer);
         buffer = [];
