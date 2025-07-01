@@ -93,6 +93,28 @@ async function insertFOIs(rows: Awaited<ReturnType<typeof fetchFOI>>[]) {
 async function insertChunk(dsId: number, chunk: any[]) {
   if (!chunk.length) return 0;
 
+  // 0 ▸ look up the NAVD88 elevation for this datastream’s Thing (cached per call)
+  const { data: dsRow, error: dsErr } = await db
+    .from("datastreams")
+    .select("thing_id")
+    .eq("datastream_id", dsId)
+    .maybeSingle();
+  if (dsErr) throw dsErr;
+
+  let navd88: number | null = null;
+  if (dsRow?.thing_id) {
+    const { data: thingRow, error: thingErr } = await db
+      .from("things")
+      .select("properties")
+      .eq("thing_id", dsRow.thing_id)
+      .maybeSingle();
+    if (thingErr) throw thingErr;
+
+    const elevStr = thingRow?.properties?.elevationNAVD88;
+    const elevNum = parseFloat(elevStr);
+    navd88 = Number.isFinite(elevNum) ? elevNum : null;   // null if missing/NaN
+    }
+
   /* 1 ▸ fetch all FOIs in parallel */
   const foiRows = await Promise.all(chunk.map((o) => fetchFOI(o["@iot.id"])));
 
@@ -106,6 +128,9 @@ async function insertChunk(dsId: number, chunk: any[]) {
     phenomenon_time_start: o.phenomenonTime,
     result_time:           o.resultTime,
     result:                o.result,
+    result_navd88:         navd88 !== null && typeof o.result === "number"
+    ? Number((o.result + navd88).toFixed(3))  // ← ROUND to 3 decimals
+    : null,
     parameters:            o.parameters,
     feature_of_interest_id: foiRows[idx].feature_of_interest_id
   }));

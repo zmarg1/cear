@@ -94,6 +94,7 @@ CREATE TABLE observations (
     phenomenon_time_end TEXT,
     result_time TEXT,
     result JSONB,
+    result_navd88 NUMERIC(6,3),
     result_quality JSONB,
     valid_time_start TEXT,
     valid_time_end TEXT,

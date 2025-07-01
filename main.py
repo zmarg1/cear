@@ -227,6 +227,15 @@ def parse_interval(val):
 
 def insert_observations(conn, c, datastream_id, observations, batch_size):
     count_since_commit = 0
+    # ── look up sensor elevation once per call ────────────────────
+    c.execute("""
+        SELECT (things.properties->>'elevationNAVD88')::NUMERIC
+        FROM datastreams
+        JOIN things ON things.thing_id = datastreams.thing_id
+        WHERE datastreams.datastream_id = %s
+    """, (datastream_id,))
+    navd88_row = c.fetchone()
+    navd88 = float(navd88_row[0]) if navd88_row and navd88_row[0] is not None else None
 
     if not observations:
         print(f"No new observations for Datastream {datastream_id}. Skipping insert.")
@@ -252,16 +261,24 @@ def insert_observations(conn, c, datastream_id, observations, batch_size):
         phenomenon_end = clean_iso_datetime(phenomenon_end) if phenomenon_end else None
         valid_start, valid_end = parse_interval(obs.get("validTime"))
 
+        # compute normalized water level
+        raw_val = obs.get("result", None)
+        norm_val = (round(raw_val + navd88, 3)        # 3-dp rounding
+                    if (navd88 is not None and raw_val is not None)
+                    else None)
+
         c.execute("""INSERT INTO observations 
             (observation_id, datastream_id, phenomenon_time_start, phenomenon_time_end,
-            result_time, result, result_quality, valid_time_start, valid_time_end, parameters, feature_of_interest_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            result_time, result, result_navd88, result_quality,
+            valid_time_start, valid_time_end, parameters, feature_of_interest_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (observation_id) DO NOTHING""",
             (obs_id, datastream_id,
             phenomenon_start,
             phenomenon_end,
             obs.get("resultTime", None),
-            json.dumps(obs.get("result", None)),
+            json.dumps(raw_val),
+            norm_val,
             json.dumps(obs.get("resultQuality", [])),
             valid_start,
             valid_end,
