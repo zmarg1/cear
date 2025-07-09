@@ -103,3 +103,11 @@ CREATE TABLE observations (
     FOREIGN KEY (feature_of_interest_id) REFERENCES features_of_interest(feature_of_interest_id),
     FOREIGN KEY (datastream_id) REFERENCES datastreams(datastream_id)
 );
+
+CREATE TABLE qc_flags (
+  observation_id INTEGER REFERENCES observations(observation_id),
+  test_name TEXT,
+  flag INTEGER CHECK (flag IN (1, 2, 3, 4, 9)),
+  PRIMARY KEY (observation_id, test_name)
+);
+

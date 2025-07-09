@@ -82,11 +82,21 @@ async function* streamNewObs(dsId: number, afterTime?: string) {
 
 /* ── NEW: bulk insert FOIs first ─────────────────────────────────── */
 async function insertFOIs(rows: Awaited<ReturnType<typeof fetchFOI>>[]) {
-  if (!rows.length) return;
+  // --- NEW: keep the first unique row per feature_of_interest_id ----
+  const byId = new Map<number, typeof rows[0]>();
+  for (const r of rows) if (!byId.has(r.feature_of_interest_id)) byId.set(r.feature_of_interest_id, r);
+  const uniqueRows = [...byId.values()];
+
+  if (!uniqueRows.length) return;
+
   const { error } = await db
     .from("features_of_interest")
-    .insert(rows, { onConflict: "feature_of_interest_id", ignoreDuplicates: true });
-  if (error && error.code !== "23505") throw error; // ignore existing rows
+    .upsert(uniqueRows, {
+      onConflict: "feature_of_interest_id",
+      ignoreDuplicates: true            // ← safe but not required when using upsert
+    });
+
+  if (error) throw error;
 }
 
 /* ── UPDATED: insert observation chunk ───────────────────────────── */
@@ -116,7 +126,7 @@ async function insertChunk(dsId: number, chunk: any[]) {
     }
 
   /* 1 ▸ fetch all FOIs in parallel */
-  const foiRows = await Promise.all(chunk.map((o) => fetchFOI(o["@iot.id"])));
+  const foiRows = await Promise.all(chunk.map(o => fetchFOI(o["@iot.id"])));
 
   /* 2 ▸ insert FOIs (idempotent) */
   await insertFOIs(foiRows);
